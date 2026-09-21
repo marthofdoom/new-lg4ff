@@ -1,0 +1,25 @@
+#!/usr/bin/make -f
+# The module is built by DKMS on the target system; this package only ships
+# the sources. Don't let dh run the top-level Makefile.
+VERSION := $(shell dpkg-parsechangelog -SVersion | cut -d- -f1)
+PKG := new-lg4ff-dkms
+SRC := debian/$(PKG)/usr/src/new-lg4ff-$(VERSION)
+
+%:
+	dh $@
+
+override_dh_auto_configure override_dh_auto_build override_dh_auto_test:
+	@true
+
+override_dh_auto_clean:
+	rm -f debian/$(PKG).postinst debian/$(PKG).prerm
+
+override_dh_auto_install:
+	install -d $(SRC)
+	install -m 644 Makefile Kbuild dkms.conf *.c *.h $(SRC)/
+	sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="$(VERSION)"/' $(SRC)/dkms.conf
+
+override_dh_installdeb:
+	sed 's/#VERSION#/$(VERSION)/g' debian/postinst.in > debian/$(PKG).postinst
+	sed 's/#VERSION#/$(VERSION)/g' debian/prerm.in > debian/$(PKG).prerm
+	dh_installdeb

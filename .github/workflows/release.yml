@@ -1,0 +1,36 @@
+name: release
+on:
+  push:
+    tags: ['v*']
+jobs:
+  deb:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build tools
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends debhelper dpkg-dev lintian
+      - name: Build the DKMS .deb
+        run: dpkg-buildpackage -us -uc -b && mv ../new-lg4ff-dkms_*.deb .
+      - name: Lint
+        run: lintian new-lg4ff-dkms_*.deb || true
+      - name: Attach to the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: new-lg4ff-dkms_*.deb
+  build-matrix:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kernel: ['6.1', '6.6', '6.12']
+    steps:
+      - uses: actions/checkout@v4
+      - name: Kernel headers ${{ matrix.kernel }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential bc kmod libelf-dev flex bison libssl-dev
+          curl -sL "https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${{ matrix.kernel }}.tar.xz" | tar -xJ
+          cd linux-${{ matrix.kernel }} && make defconfig >/dev/null && make modules_prepare >/dev/null
+      - name: Build module
+        run: make KDIR=$PWD/linux-${{ matrix.kernel }}

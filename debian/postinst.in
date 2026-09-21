@@ -1,0 +1,20 @@
+#!/bin/sh
+set -e
+NAME=new-lg4ff
+VERSION=#VERSION#
+case "$1" in
+    configure)
+        dkms add -m "$NAME" -v "$VERSION" || true
+        if dkms build -m "$NAME" -v "$VERSION"; then
+            dkms install -m "$NAME" -v "$VERSION" --force
+            # Load the new module now if a wheel is plugged in; otherwise it
+            # loads on the next plug/boot. Updating the initramfs makes the
+            # replacement effective at boot on systems that include hid modules.
+            if command -v update-initramfs >/dev/null 2>&1; then update-initramfs -u -k all >/dev/null 2>&1 || true; fi
+        else
+            echo "new-lg4ff: DKMS build failed; install the headers for your kernel and run: dkms install $NAME/$VERSION" >&2
+        fi
+        ;;
+esac
+#DEBHELPER#
+exit 0

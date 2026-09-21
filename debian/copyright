@@ -1,0 +1,10 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: new-lg4ff
+Source: https://github.com/marthofdoom/new-lg4ff
+
+Files: *
+Copyright: 2019-2025 Bernat Arlandis and contributors
+           2026 marth
+License: GPL-2
+ On Debian systems the full text of the GNU General Public License version 2
+ can be found in /usr/share/common-licenses/GPL-2.
