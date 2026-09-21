@@ -2,7 +2,7 @@
 #ifndef __HID_LG_H
 #define __HID_LG_H
 
-#define VERSION "0.6.0"
+#define VERSION "0.7.0"
 
 struct lg_drv_data {
 	unsigned long quirks;
