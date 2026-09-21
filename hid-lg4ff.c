@@ -30,6 +30,12 @@
 /* Device has a "friction" effect in firmware */
 #define LG4FF_CAP_FRICTION 1
 
+/* invert_pedals bit mask, by evdev axis */
+#define LG4FF_INVERT_ABS_Y BIT(0)
+#define LG4FF_INVERT_ABS_Z BIT(1)
+#define LG4FF_INVERT_ABS_RZ BIT(2)
+#define LG4FF_INVERT_ALL (LG4FF_INVERT_ABS_Y | LG4FF_INVERT_ABS_Z | LG4FF_INVERT_ABS_RZ)
+
 #define LG4FF_MODE_NATIVE_IDX 0
 #define LG4FF_MODE_DFEX_IDX 1
 #define LG4FF_MODE_DFP_IDX 2
@@ -139,6 +145,7 @@ struct lg4ff_wheel_data {
 	u16 autocenter;
 	u16 master_gain;
 	u16 gain;
+	u16 invert_pedals;
 	const u16 min_range;
 	const u16 max_range;
 #ifdef CONFIG_LEDS_CLASS
@@ -166,6 +173,13 @@ struct lg4ff_device_entry {
 	struct lg4ff_effect_state states[LG4FF_MAX_EFFECTS];
 	unsigned peak_ffb_level;
 	int effects_used;
+	/* Last raw value and limits of ABS_X..ABS_RZ, so a setting change can
+	 * be applied without waiting for the wheel to report again */
+	struct input_dev *axis_dev;
+	s32 axis_raw[ABS_RZ + 1];
+	s32 axis_min[ABS_RZ + 1];
+	s32 axis_max[ABS_RZ + 1];
+	unsigned long axis_seen;
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -1154,30 +1168,79 @@ static s32 lg4ff_adjust_dfp_x_axis(s32 value, u16 range)
 		return new_value;
 }
 
+/* Apply the user settings (pedal inversion) to a raw axis value. `value`
+ * for ABS_X is after the DFP range correction. */
+static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code, s32 value)
+{
+	u16 bit;
+
+	switch (code) {
+	case ABS_Y:
+		bit = LG4FF_INVERT_ABS_Y;
+		break;
+	case ABS_Z:
+		bit = LG4FF_INVERT_ABS_Z;
+		break;
+	case ABS_RZ:
+		bit = LG4FF_INVERT_ABS_RZ;
+		break;
+	default:
+		return value;
+	}
+	if (entry->wdata.invert_pedals & bit)
+		return entry->axis_max[code] + entry->axis_min[code] - value;
+	return value;
+}
+
 int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 			     struct hid_usage *usage, s32 value, struct lg_drv_data *drv_data)
 {
 	struct lg4ff_device_entry *entry = drv_data->device_props;
-	s32 new_value = 0;
+	s32 new_value;
 
 	if (!entry) {
 		hid_err(hid, "Device properties not found");
 		return 0;
 	}
 
-	switch (entry->wdata.product_id) {
-	case USB_DEVICE_ID_LOGITECH_DFP_WHEEL:
-		switch (usage->code) {
-		case ABS_X:
-			new_value = lg4ff_adjust_dfp_x_axis(value, entry->wdata.range);
-			input_event(field->hidinput->input, usage->type, usage->code, new_value);
-			return 1;
-		default:
-			return 0;
-		}
+	if (usage->type != EV_ABS || usage->code > ABS_RZ)
+		return 0;
+
+	switch (usage->code) {
+	case ABS_X:
+		if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
+			value = lg4ff_adjust_dfp_x_axis(value, entry->wdata.range);
+		break;
+	case ABS_Y:
+	case ABS_Z:
+	case ABS_RZ:
+		break;
 	default:
 		return 0;
 	}
+
+	entry->axis_dev = field->hidinput->input;
+	entry->axis_raw[usage->code] = value;
+	entry->axis_min[usage->code] = field->logical_minimum;
+	entry->axis_max[usage->code] = field->logical_maximum;
+	__set_bit(usage->code, &entry->axis_seen);
+
+	new_value = lg4ff_adjust_axis(entry, usage->code, value);
+	if (new_value == value && entry->wdata.product_id != USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
+		return 0;
+
+	input_event(field->hidinput->input, usage->type, usage->code, new_value);
+	return 1;
+}
+
+/* Re-emit an axis through the current settings (after a sysfs change) */
+static void lg4ff_reemit_axis(struct lg4ff_device_entry *entry, unsigned int code)
+{
+	if (!entry->axis_dev || !test_bit(code, &entry->axis_seen))
+		return;
+	input_event(entry->axis_dev, EV_ABS, code,
+		    lg4ff_adjust_axis(entry, code, entry->axis_raw[code]));
+	input_sync(entry->axis_dev);
 }
 
 int lg4ff_raw_event(struct hid_device *hdev, struct hid_report *report,
@@ -1270,6 +1333,7 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 		struct lg4ff_wheel_data t_wdata =  { .product_id = wheel->product_id,
 						     .real_product_id = real_product_id,
 						     .combine = 0,
+						     .invert_pedals = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
 						     .set_range = wheel->set_range,
@@ -1757,6 +1821,46 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 	return count;
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
+
+/* Invert pedal axes. Bit mask: 1 = ABS_Y, 2 = ABS_Z, 4 = ABS_RZ, 7 = all.
+ * Inverted pedals report 0 when released, like gamepad triggers. */
+static ssize_t lg4ff_invert_pedals_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.invert_pedals);
+}
+
+static ssize_t lg4ff_invert_pedals_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 mask;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &mask) || mask > LG4FF_INVERT_ALL)
+		return -EINVAL;
+
+	entry->wdata.invert_pedals = mask;
+	lg4ff_reemit_axis(entry, ABS_Y);
+	lg4ff_reemit_axis(entry, ABS_Z);
+	lg4ff_reemit_axis(entry, ABS_RZ);
+
+	return count;
+}
+static DEVICE_ATTR(invert_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_invert_pedals_show, lg4ff_invert_pedals_store);
 
 /* Export the currently set range of the wheel */
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr,
@@ -2415,6 +2519,9 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_range);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"range\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_invert_pedals);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"invert_pedals\", errno %d\n", error);
 	if (mmode_ret == LG4FF_MMODE_IS_MULTIMODE) {
 		error = device_create_file(&hid->dev, &dev_attr_real_id);
 		if (error)
@@ -2521,6 +2628,7 @@ int lg4ff_deinit(struct hid_device *hid)
 
 	device_remove_file(&hid->dev, &dev_attr_combine_pedals);
 	device_remove_file(&hid->dev, &dev_attr_range);
+	device_remove_file(&hid->dev, &dev_attr_invert_pedals);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);
