@@ -56,7 +56,7 @@ following ones:
 - Gain up to 150 % (`gain` up to 98303) with the FFB meter showing clipping.
 - 32 simultaneous effects.
 - Rumble emulation (`FF_RUMBLE`): gamepad-style games get a vibration on the
-  wheel; `rumble_level` sets how strong.
+  wheel; `rumble_level` (0-100, default 50) sets how strong.
 - `invert_pedals`: per-axis pedal inversion (bit mask: 1 = ABS_Y, 2 = ABS_Z,
   4 = ABS_RZ) so pedals report 0 when released like gamepad triggers.
 

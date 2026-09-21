@@ -10,6 +10,15 @@ import sys
 import time
 
 from evdev import InputDevice, ecodes, ff
+import ctypes, fcntl
+
+class uinput_ff:
+    """EVIOCSFF without python-evdev's GIL-holding wrapper"""
+    EVIOCSFF = (1 << 30) | (ctypes.sizeof(ff.Effect) << 16) | (ord('E') << 8) | 0x80
+    @staticmethod
+    def upload_effect(fd, effect):
+        fcntl.ioctl(fd, uinput_ff.EVIOCSFF, effect)
+        return effect.id
 
 def find_wheel():
     for sysdir in glob.glob('/sys/bus/hid/drivers/logitech/*:046D:*'):
@@ -187,6 +196,18 @@ def main():
             start(rumble); drain(dev, 0.6); playing.pop()
             peak = int(read(sysdir, 'peak_ffb_level'))
             ok &= check(7000 <= peak <= 9000, "strong rumble 0x8000 at rumble_level 50 -> peak {} (~8192)".format(peak))
+            # Games re-upload rumble every frame; the vibration must carry on, not restart
+            write(sysdir, 'peak_ffb_level', 0)
+            eid = start(rumble)
+            for _ in range(18):
+                uinput_ff.upload_effect(dev.fd, ff.Effect(ecodes.FF_RUMBLE, eid, 0, ff.Trigger(0, 0), ff.Replay(300, 0),
+                                        ff.EffectType(ff_rumble_effect=ff.Rumble(strong_magnitude=0x8000, weak_magnitude=0))))
+                dev.write(ecodes.EV_FF, eid, 1)
+                drain(dev, 0.016)
+            drain(dev, 0.2)
+            playing.pop(); dev.erase_effect(eid)
+            peak = int(read(sysdir, 'peak_ffb_level'))
+            ok &= check(7000 <= peak <= 9000, "rumble re-uploaded every 16 ms still peaks {} (~8192)".format(peak))
             write(sysdir, 'rumble_level', saved['rumble_level'])
         else:
             ok &= check(False, "FF_RUMBLE advertised")

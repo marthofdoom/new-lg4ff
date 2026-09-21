@@ -1,12 +1,25 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 — 2026-09-20
 
 ### Added
 - Rumble emulation: `FF_RUMBLE` is advertised and rendered as a 30 Hz
   (strong) / 60 Hz (weak) vibration on the wheel, so games that only know
   gamepad rumble produce something. `rumble_level` (0-100, default 50)
-  scales it; `rumble_level` module parameter sets the default.
+  scales it; `rumble_level` module parameter sets the default. Note: the
+  kernel already advertised FF_RUMBLE on these wheels (ff-core turned it
+  into a silent sine), so what changes is that SDL / Steam Input rumble now
+  actually shakes the wheel.
+
+### Fixed
+- Effect timing now uses a millisecond clock from ktime instead of jiffies,
+  so fast periodics and rumble are sampled at the timer rate on HZ=250/300
+  kernels too.
+- Rumble keeps its phase across the per-frame re-uploads games do.
+- A ramp effect whose attack + fade covers its whole length no longer
+  divides by zero in the timer.
+- `rumble_level` / `spring_level` / `damper_level` / `friction_level`
+  module parameters are clamped to 0-100.
 
 ## 0.6.0 — 2026-09-20
 
