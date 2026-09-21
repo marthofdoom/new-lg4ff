@@ -49,6 +49,8 @@ following ones:
 - Persistent centering spring (`autocenter_persistent`): games can't turn the
   autocenter off.
 - `app_gain`: choose whether games may adjust the force feedback gain.
+- `invert_pedals`: per-axis pedal inversion (bit mask: 1 = ABS_Y, 2 = ABS_Z,
+  4 = ABS_RZ) so pedals report 0 when released like gamepad triggers.
 
 ## Requirements
 

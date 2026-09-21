@@ -34,6 +34,12 @@
 #define LG4FF_SENSITIVITY_LINEAR 50
 #define LG4FF_SENSITIVITY_MAX 100
 
+/* invert_pedals bit mask, by evdev axis */
+#define LG4FF_INVERT_ABS_Y BIT(0)
+#define LG4FF_INVERT_ABS_Z BIT(1)
+#define LG4FF_INVERT_ABS_RZ BIT(2)
+#define LG4FF_INVERT_ALL (LG4FF_INVERT_ABS_Y | LG4FF_INVERT_ABS_Z | LG4FF_INVERT_ABS_RZ)
+
 #define LG4FF_MODE_NATIVE_IDX 0
 #define LG4FF_MODE_DFEX_IDX 1
 #define LG4FF_MODE_DFP_IDX 2
@@ -146,6 +152,7 @@ struct lg4ff_wheel_data {
 	u16 sensitivity;
 	u16 autocenter_persistent;
 	u16 app_gain;
+	u16 invert_pedals;
 	const u16 min_range;
 	const u16 max_range;
 #ifdef CONFIG_LEDS_CLASS
@@ -1221,8 +1228,28 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 		return 0;
 	}
 
-	if (usage->type != EV_ABS || usage->code != ABS_X)
+	if (usage->type != EV_ABS)
 		return 0;
+
+	switch (usage->code) {
+	case ABS_X:
+		break;
+	case ABS_Y:
+	case ABS_Z:
+	case ABS_RZ:
+		{
+			u16 bit = usage->code == ABS_Y ? LG4FF_INVERT_ABS_Y :
+				  usage->code == ABS_Z ? LG4FF_INVERT_ABS_Z : LG4FF_INVERT_ABS_RZ;
+
+			if (!(entry->wdata.invert_pedals & bit))
+				return 0;
+			input_event(field->hidinput->input, usage->type, usage->code,
+				    field->logical_maximum + field->logical_minimum - value);
+			return 1;
+		}
+	default:
+		return 0;
+	}
 
 	new_value = value;
 	if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
@@ -1339,6 +1366,7 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 						     .sensitivity = LG4FF_SENSITIVITY_LINEAR,
 						     .autocenter_persistent = 0,
 						     .app_gain = 1,
+						     .invert_pedals = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
 						     .set_range = wheel->set_range,
@@ -1836,6 +1864,43 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 	return count;
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
+
+/* Invert pedal axes. Bit mask: 1 = ABS_Y, 2 = ABS_Z, 4 = ABS_RZ, 7 = all.
+ * Inverted pedals report 0 when released, like gamepad triggers. */
+static ssize_t lg4ff_invert_pedals_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.invert_pedals);
+}
+
+static ssize_t lg4ff_invert_pedals_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 mask;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &mask) || mask > LG4FF_INVERT_ALL)
+		return -EINVAL;
+
+	entry->wdata.invert_pedals = mask;
+
+	return count;
+}
+static DEVICE_ATTR(invert_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_invert_pedals_show, lg4ff_invert_pedals_store);
 
 /* Export the currently set range of the wheel */
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr,
@@ -2632,6 +2697,9 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_sensitivity);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"sensitivity\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_invert_pedals);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"invert_pedals\", errno %d\n", error);
 	if (mmode_ret == LG4FF_MMODE_IS_MULTIMODE) {
 		error = device_create_file(&hid->dev, &dev_attr_real_id);
 		if (error)
@@ -2745,6 +2813,7 @@ int lg4ff_deinit(struct hid_device *hid)
 	device_remove_file(&hid->dev, &dev_attr_combine_pedals);
 	device_remove_file(&hid->dev, &dev_attr_range);
 	device_remove_file(&hid->dev, &dev_attr_sensitivity);
+	device_remove_file(&hid->dev, &dev_attr_invert_pedals);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);
