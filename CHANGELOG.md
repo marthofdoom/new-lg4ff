@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Rumble emulation: `FF_RUMBLE` is advertised and rendered as a 30 Hz
+  (strong) / 60 Hz (weak) vibration on the wheel, so games that only know
+  gamepad rumble produce something. `rumble_level` (0-100, default 50)
+  scales it; `rumble_level` module parameter sets the default.
+
 ## 0.6.0 — 2026-09-20
 
 Logitech G29 Windows-parity and force-feedback engine work. All verified on
