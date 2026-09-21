@@ -174,6 +174,11 @@ struct lg4ff_device_entry {
 	unsigned peak_ffb_level;
 	int effects_used;
 	int autocenter_from_user;
+	struct input_dev *x_axis_dev;
+	s32 x_axis_raw;
+	s32 x_axis_min;
+	s32 x_axis_max;
+	int x_axis_seen;
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -1222,6 +1227,15 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 	new_value = value;
 	if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
 		new_value = lg4ff_adjust_dfp_x_axis(new_value, entry->wdata.range);
+
+	/* Remembered so a sensitivity change can be applied without waiting
+	 * for the wheel to move */
+	entry->x_axis_dev = field->hidinput->input;
+	entry->x_axis_raw = new_value;
+	entry->x_axis_min = field->logical_minimum;
+	entry->x_axis_max = field->logical_maximum;
+	entry->x_axis_seen = 1;
+
 	new_value = lg4ff_apply_sensitivity(new_value, field->logical_minimum,
 					    field->logical_maximum, entry->wdata.sensitivity);
 
@@ -1899,6 +1913,14 @@ static ssize_t lg4ff_sensitivity_store(struct device *dev, struct device_attribu
 		return -EINVAL;
 
 	entry->wdata.sensitivity = sensitivity;
+
+	/* Re-emit the current position through the new curve */
+	if (entry->x_axis_seen) {
+		input_event(entry->x_axis_dev, EV_ABS, ABS_X,
+			    lg4ff_apply_sensitivity(entry->x_axis_raw, entry->x_axis_min,
+						    entry->x_axis_max, sensitivity));
+		input_sync(entry->x_axis_dev);
+	}
 
 	return count;
 }
