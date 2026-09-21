@@ -17,13 +17,34 @@ from math import isqrt
 from evdev import InputDevice, ecodes, ff
 
 def find_wheel():
+    """The wheel's sysfs directory and an evdev handle. When Oversteer's proxy
+    service holds the wheel (its node is then root-only), use the proxy's
+    virtual device: it forwards effects and reports the same axes."""
     for sysdir in glob.glob('/sys/bus/hid/drivers/logitech/*:046D:*'):
         for ev in glob.glob(os.path.join(sysdir, 'input/input*/event*')):
-            dev = InputDevice('/dev/input/' + os.path.basename(ev))
+            node = '/dev/input/' + os.path.basename(ev)
+            if not os.access(node, os.R_OK | os.W_OK):
+                node = _proxied(node)
+                if node is None:
+                    continue
+            dev = InputDevice(node)
             if ecodes.EV_FF in dev.capabilities():
                 return sysdir, dev
             dev.close()
     return None, None
+
+
+def _proxied(node):
+    try:
+        import json
+        status = json.load(open('/run/oversteer/proxies.json'))
+    except (OSError, ValueError):
+        return None
+    for proxy in status.get('proxies', []):
+        if node in proxy.get('sources', {}).values() and proxy.get('devnode'):
+            print("note: {} is held by the Oversteer proxy; using {}".format(node, proxy['devnode']))
+            return proxy['devnode']
+    return None
 
 def read(sysdir, name):
     with open(os.path.join(sysdir, name)) as f:
