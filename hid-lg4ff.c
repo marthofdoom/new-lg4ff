@@ -115,6 +115,10 @@
  * virtual mass at maximum coefficient about a quarter of the wheel's own;
  * more than that and the delayed acceleration feedback oscillates. */
 #define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 80)
+/* Rumble emulation: the two motor magnitudes become sines at these periods */
+#define LG4FF_RUMBLE_STRONG_PERIOD 33	/* ms, ~30 Hz */
+#define LG4FF_RUMBLE_WEAK_PERIOD 16	/* ms, ~60 Hz */
+
 #define LG4FF_KIN_HISTORY 8		/* acceleration baseline: velocity 8 ticks ago */
 #define LG4FF_KIN_RESYNC_NS (100 * NSEC_PER_MSEC)	/* gap after which kinematics restart */
 #define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */
@@ -239,6 +243,7 @@ static const signed short lg4ff_wheel_effects[] = {
 	FF_RAMP,
 	FF_FRICTION,
 	FF_INERTIA,
+	FF_RUMBLE,
 	-1
 };
 
@@ -495,6 +500,10 @@ static int ffb_leds = 0;
 module_param(ffb_leds, int, 0);
 MODULE_PARM_DESC(ffb_leds, "Use leds to display FFB levels for calibration.");
 #endif
+
+static int rumble_level = 50;
+module_param(rumble_level, int, 0);
+MODULE_PARM_DESC(rumble_level, "Level of emulated rumble vibration (0-100).");
 
 static int spring_level = 30;
 module_param(spring_level, int, 0);
@@ -758,6 +767,25 @@ static __always_inline int lg4ff_calculate_periodic(struct lg4ff_effect_state *s
 	}
 
 	return state->direction_gain * level / 0x7fff;
+}
+
+/* Rumble emulation: wheels have no rumble motors, so the strong and weak
+ * magnitudes become a low and a higher frequency vibration on the wheel.
+ * Rumble has no direction. */
+static __always_inline int lg4ff_calculate_rumble(struct lg4ff_effect_state *state)
+{
+	struct ff_rumble_effect *rumble = &state->effect.u.rumble;
+	unsigned long t = state->time_playing;
+	int strong = rumble->strong_magnitude / 2;	/* u16 -> s16 scale */
+	int weak = rumble->weak_magnitude / 4;
+	int level = 0;
+
+	if (strong)
+		level += fixp_sin16((t % LG4FF_RUMBLE_STRONG_PERIOD) * 360 / LG4FF_RUMBLE_STRONG_PERIOD) * strong / 0x7fff;
+	if (weak)
+		level += fixp_sin16((t % LG4FF_RUMBLE_WEAK_PERIOD) * 360 / LG4FF_RUMBLE_WEAK_PERIOD) * weak / 0x7fff;
+
+	return level * rumble_level / 100;
 }
 
 static __always_inline void lg4ff_calculate_spring(struct lg4ff_effect_state *state, struct lg4ff_effect_parameters *parameters)
@@ -1066,6 +1094,9 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 				break;
 			case FF_PERIODIC:
 				parameters[0].level += lg4ff_calculate_periodic(state);
+				break;
+			case FF_RUMBLE:
+				parameters[0].level += lg4ff_calculate_rumble(state);
 				break;
 			case FF_SPRING:
 				if (state->slot != 0) {
@@ -2517,6 +2548,26 @@ static ssize_t lg4ff_friction_level_store(struct device *dev, struct device_attr
 
 	return count;
 }
+static ssize_t lg4ff_rumble_level_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	return scnprintf(buf, PAGE_SIZE, "%u\n", rumble_level);
+}
+
+static ssize_t lg4ff_rumble_level_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	u16 level;
+
+	if (kstrtou16(buf, 10, &level) || level > 100)
+		return -EINVAL;
+
+	rumble_level = level;
+
+	return count;
+}
+static DEVICE_ATTR(rumble_level, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_rumble_level_show, lg4ff_rumble_level_store);
+
 static DEVICE_ATTR(friction_level, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_friction_level_show, lg4ff_friction_level_store);
 
 static ssize_t lg4ff_peak_ffb_level_show(struct device *dev, struct device_attribute *attr,
@@ -2900,8 +2951,6 @@ int lg4ff_init(struct hid_device *hid)
 
 	error = input_ff_create(dev, LG4FF_MAX_EFFECTS);
 
-	//__clear_bit(FF_RUMBLE, dev->ffbit);
-
 	if (error)
 		goto err_init;
 
@@ -3000,6 +3049,11 @@ int lg4ff_init(struct hid_device *hid)
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"damper_level\", errno %d\n", error);
 		}
+		if (test_bit(FF_RUMBLE, dev->ffbit)) {
+			error = device_create_file(&hid->dev, &dev_attr_rumble_level);
+			if (error)
+				hid_warn(hid, "Unable to create sysfs interface for \"rumble_level\", errno %d\n", error);
+		}
 		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_friction_level);
 			if (error)
@@ -3093,6 +3147,9 @@ int lg4ff_deinit(struct hid_device *hid)
 		}
 		if (test_bit(FF_DAMPER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_damper_level);
+		}
+		if (test_bit(FF_RUMBLE, dev->ffbit)) {
+			device_remove_file(&hid->dev, &dev_attr_rumble_level);
 		}
 		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_friction_level);

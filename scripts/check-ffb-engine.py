@@ -177,6 +177,20 @@ def main():
         else:
             print("  (no friction_level attribute)")
 
+        print("rumble emulation")
+        if ecodes.FF_RUMBLE in dev.capabilities().get(ecodes.EV_FF, []):
+            saved['rumble_level'] = read(sysdir, 'rumble_level')
+            write(sysdir, 'rumble_level', 50)
+            write(sysdir, 'peak_ffb_level', 0)
+            rumble = ff.Effect(ecodes.FF_RUMBLE, -1, 0, ff.Trigger(0, 0), ff.Replay(300, 0),
+                               ff.EffectType(ff_rumble_effect=ff.Rumble(strong_magnitude=0x8000, weak_magnitude=0)))
+            start(rumble); drain(dev, 0.6); playing.pop()
+            peak = int(read(sysdir, 'peak_ffb_level'))
+            ok &= check(7000 <= peak <= 9000, "strong rumble 0x8000 at rumble_level 50 -> peak {} (~8192)".format(peak))
+            write(sysdir, 'rumble_level', saved['rumble_level'])
+        else:
+            ok &= check(False, "FF_RUMBLE advertised")
+
         print("gain above 100 %")
         write(sysdir, 'gain', 98303)
         ok &= check(read(sysdir, 'gain') == '98303', "gain accepts 150 % (98303)")
