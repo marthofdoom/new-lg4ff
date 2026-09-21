@@ -11,5 +11,5 @@ insmod ./hid-logitech-new.ko ${OPTIONS}
 sleep 1
 for d in /sys/bus/hid/drivers/logitech/*:046D:*; do
     [ -d "$d" ] || continue
-    echo "$(basename "$d"): range=$(cat "$d/range" 2>/dev/null) sensitivity=$(cat "$d/sensitivity" 2>/dev/null)"
+    echo "$(basename "$d"): range=$(cat "$d/range" 2>/dev/null) sensitivity=$(cat "$d/sensitivity" 2>/dev/null) autocenter_persistent=$(cat "$d/autocenter_persistent" 2>/dev/null) app_gain=$(cat "$d/app_gain" 2>/dev/null)"
 done

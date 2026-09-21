@@ -144,6 +144,8 @@ struct lg4ff_wheel_data {
 	u16 master_gain;
 	u16 gain;
 	u16 sensitivity;
+	u16 autocenter_persistent;
+	u16 app_gain;
 	const u16 min_range;
 	const u16 max_range;
 #ifdef CONFIG_LEDS_CLASS
@@ -171,6 +173,7 @@ struct lg4ff_device_entry {
 	struct lg4ff_effect_state states[LG4FF_MAX_EFFECTS];
 	unsigned peak_ffb_level;
 	int effects_used;
+	int autocenter_from_user;
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -833,7 +836,7 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 
 	memset(parameters, 0, sizeof(parameters));
 
-	gain = (unsigned)entry->wdata.master_gain * entry->wdata.gain / 0xffff;
+	gain = (unsigned)entry->wdata.master_gain * (entry->wdata.app_gain ? entry->wdata.gain : 0xffff) / 0xffff;
 
 	spin_lock_irqsave(&entry->timer_lock, flags);
 
@@ -1320,6 +1323,8 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 						     .real_product_id = real_product_id,
 						     .combine = 0,
 						     .sensitivity = LG4FF_SENSITIVITY_LINEAR,
+						     .autocenter_persistent = 0,
+						     .app_gain = 1,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
 						     .set_range = wheel->set_range,
@@ -1343,6 +1348,11 @@ static void lg4ff_set_autocenter_default(struct input_dev *dev, u16 magnitude)
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
+		return;
+	}
+
+	if (entry->wdata.autocenter_persistent && !entry->autocenter_from_user) {
+		dbg_hid("ignoring application autocenter request, persistent centering spring is on\n");
 		return;
 	}
 
@@ -1408,6 +1418,11 @@ static void lg4ff_set_autocenter_ffex(struct input_dev *dev, u16 magnitude)
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
+		return;
+	}
+
+	if (entry->wdata.autocenter_persistent && !entry->autocenter_from_user) {
+		dbg_hid("ignoring application autocenter request, persistent centering spring is on\n");
 		return;
 	}
 
@@ -1957,6 +1972,44 @@ static ssize_t lg4ff_gain_store(struct device *dev, struct device_attribute *att
 }
 static DEVICE_ATTR(gain, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_gain_show, lg4ff_gain_store);
 
+/* Allow applications to adjust the gain (FF_GAIN). When off, only the
+ * sysfs gain applies; the application's value is remembered and used
+ * again once re-enabled. */
+static ssize_t lg4ff_app_gain_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.app_gain);
+}
+
+static ssize_t lg4ff_app_gain_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	bool app_gain;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtobool(buf, &app_gain))
+		return -EINVAL;
+
+	entry->wdata.app_gain = app_gain;
+
+	return count;
+}
+static DEVICE_ATTR(app_gain, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_app_gain_show, lg4ff_app_gain_store);
+
 /* Export the currently set autocenter of the wheel */
 static ssize_t lg4ff_autocenter_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
@@ -1982,17 +2035,70 @@ static ssize_t lg4ff_autocenter_store(struct device *dev, struct device_attribut
 	struct hid_device *hid = to_hid_device(dev);
 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
 	struct input_dev *inputdev = hidinput->input;
+	struct lg4ff_device_entry *entry;
 	u16 autocenter = simple_strtoul(buf, NULL, 10);
 
 	if (autocenter > 0xffff) {
 		autocenter = 0xffff;
 	}
 
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	entry->autocenter_from_user = 1;
 	inputdev->ff->set_autocenter(inputdev, autocenter);
+	entry->autocenter_from_user = 0;
 
 	return count;
 }
 static DEVICE_ATTR(autocenter, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_autocenter_show, lg4ff_autocenter_store);
+
+/* Persistent centering spring: when set, applications can't change or
+ * disable the autocenter value set through sysfs. */
+static ssize_t lg4ff_autocenter_persistent_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.autocenter_persistent);
+}
+
+static ssize_t lg4ff_autocenter_persistent_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+	struct input_dev *inputdev = hidinput->input;
+	struct lg4ff_device_entry *entry;
+	bool persistent;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtobool(buf, &persistent))
+		return -EINVAL;
+
+	entry->wdata.autocenter_persistent = persistent;
+	if (persistent) {
+		/* Re-apply the user's value in case an application had changed it */
+		entry->autocenter_from_user = 1;
+		inputdev->ff->set_autocenter(inputdev, entry->wdata.autocenter);
+		entry->autocenter_from_user = 0;
+	}
+
+	return count;
+}
+static DEVICE_ATTR(autocenter_persistent, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_autocenter_persistent_show, lg4ff_autocenter_persistent_store);
 
 static ssize_t lg4ff_spring_level_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
@@ -2517,10 +2623,16 @@ int lg4ff_init(struct hid_device *hid)
 		error = device_create_file(&hid->dev, &dev_attr_gain);
 		if (error)
 			hid_warn(hid, "Unable to create sysfs interface for \"gain\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_app_gain);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"app_gain\", errno %d\n", error);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_autocenter);
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"autocenter\", errno %d\n", error);
+			error = device_create_file(&hid->dev, &dev_attr_autocenter_persistent);
+			if (error)
+				hid_warn(hid, "Unable to create sysfs interface for \"autocenter_persistent\", errno %d\n", error);
 		}
 		error = device_create_file(&hid->dev, &dev_attr_peak_ffb_level);
 		if (error)
@@ -2614,8 +2726,10 @@ int lg4ff_deinit(struct hid_device *hid)
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);
+		device_remove_file(&hid->dev, &dev_attr_app_gain);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_autocenter);
+			device_remove_file(&hid->dev, &dev_attr_autocenter_persistent);
 		}
 		device_remove_file(&hid->dev, &dev_attr_peak_ffb_level);
 		if (test_bit(FF_SPRING, dev->ffbit)) {

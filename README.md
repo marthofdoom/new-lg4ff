@@ -44,6 +44,11 @@ following ones:
   applications.
 - SYSFS entries for gain, autocenter, spring/damper/friction effect gain and
   FFBmeter.
+- Steering sensitivity curve (`sensitivity`, 0-100, 50 = linear) like the
+  Logitech Windows software.
+- Persistent centering spring (`autocenter_persistent`): games can't turn the
+  autocenter off.
+- `app_gain`: choose whether games may adjust the force feedback gain.
 
 ## Requirements
 
