@@ -14,6 +14,7 @@
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/fixp-arith.h>
+#include <linux/math64.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
@@ -97,7 +98,17 @@
 #define fixp_sin16(v) (((v % 360) > 180)? -(fixp_sin32((v % 360) - 180) >> 16) : fixp_sin32(v) >> 16)
 
 #define DEFAULT_TIMER_PERIOD 2
-#define LG4FF_MAX_EFFECTS 16
+#define LG4FF_MAX_EFFECTS 32
+
+/* Master gain: 0..LG4FF_GAIN_MAX, 0xffff is 100 % (like LGS, up to 150 %) */
+#define LG4FF_GAIN_MAX 0x17fff
+
+/* Software condition effects: kinematics scale. Position is -0x8000..0x7fff
+ * over the wheel's range. Velocity of one full range per second and an
+ * acceleration reaching that in 0.1 s map to full scale. */
+#define LG4FF_VEL_FULL 65535
+#define LG4FF_ACC_FULL (65535 * 10)
+#define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */
 
 #define FF_EFFECT_STARTED 0
 #define FF_EFFECT_ALLSET 1
@@ -147,12 +158,13 @@ struct lg4ff_wheel_data {
 	u16 combine;
 	u16 range;
 	u16 autocenter;
-	u16 master_gain;
+	u32 master_gain;
 	u16 gain;
 	u16 sensitivity;
 	u16 autocenter_persistent;
 	u16 app_gain;
 	u16 invert_pedals;
+	u16 inertia_mode;	/* 0: as damper (Windows), 1: rendered in software */
 	const u16 min_range;
 	const u16 max_range;
 #ifdef CONFIG_LEDS_CLASS
@@ -188,6 +200,13 @@ struct lg4ff_device_entry {
 	s32 axis_min[ABS_RZ + 1];
 	s32 axis_max[ABS_RZ + 1];
 	unsigned long axis_seen;
+	/* Wheel kinematics for software condition effects, s16 scale */
+	u64 kin_time;
+	s32 kin_pos;
+	s32 kin_vel;
+	s32 kin_acc;
+	int kin_valid;
+	unsigned sw_conditions;		/* effects rendered in software this tick */
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -748,6 +767,110 @@ static __always_inline void lg4ff_calculate_resistance(struct lg4ff_effect_state
 	parameters->clip = (unsigned)condition->right_saturation;
 }
 
+/* value * gain / 0xffff without overflowing on 32 bit for gains above 100 % */
+static __always_inline int lg4ff_apply_gain(int value, unsigned gain)
+{
+	return (int)div_s64((s64)value * gain, 0xffff);
+}
+
+/* Update position / velocity / acceleration from the last reported wheel
+ * position. Called every timer tick; the position only changes when the
+ * wheel reports, so velocity decays to zero when it stands still. */
+static __always_inline void lg4ff_update_kinematics(struct lg4ff_device_entry *entry)
+{
+	u64 t = ktime_get_ns();
+	s32 min, max, half, pos, vel, acc;
+	u32 dt_us;
+
+	if (!test_bit(ABS_X, &entry->axis_seen)) {
+		entry->kin_valid = 0;
+		return;
+	}
+	min = entry->axis_min[ABS_X];
+	max = entry->axis_max[ABS_X];
+	half = (max - min + 1) / 2;
+	if (half <= 0) {
+		entry->kin_valid = 0;
+		return;
+	}
+	pos = (s32)div_s64((s64)(entry->axis_raw[ABS_X] - min - half) * 0x7fff, half);
+
+	if (!entry->kin_valid) {
+		entry->kin_time = t;
+		entry->kin_pos = pos;
+		entry->kin_vel = 0;
+		entry->kin_acc = 0;
+		entry->kin_valid = 1;
+		return;
+	}
+	dt_us = (u32)div_u64(t - entry->kin_time, 1000);
+	if (dt_us < 500)
+		return;
+	entry->kin_time = t;
+	vel = (s32)div_s64((s64)(pos - entry->kin_pos) * 1000000, dt_us);
+	acc = (s32)div_s64((s64)(vel - entry->kin_vel) * 1000000, dt_us);
+	entry->kin_pos = pos;
+	/* Light smoothing: the position is quantised and reports are bursty */
+	entry->kin_vel += (vel - entry->kin_vel) / 4;
+	entry->kin_acc += (acc - entry->kin_acc) / 8;
+}
+
+/* Render a condition effect in software. Used for inertia (when enabled)
+ * and for effects that didn't get one of the three hardware slots.
+ * Positive result is a force to the left (decreasing ABS_X). */
+static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entry *entry, struct lg4ff_effect_state *state, int level_percent)
+{
+	struct ff_condition_effect *c = &state->effect.u.condition[0];
+	int input, dev, k, sat, force, half_db;
+
+	if (!entry->kin_valid)
+		return 0;
+
+	switch (state->effect.type) {
+	case FF_SPRING:
+		input = entry->kin_pos;
+		break;
+	case FF_DAMPER:
+		input = (int)div_s64((s64)entry->kin_vel * 0x7fff, LG4FF_VEL_FULL);
+		break;
+	case FF_FRICTION:
+		/* Constant force opposing motion, ramped in over a small velocity
+		 * window so it doesn't chatter around zero */
+		input = (int)div_s64((s64)entry->kin_vel * 0x7fff, LG4FF_FRICTION_VEL);
+		break;
+	case FF_INERTIA:
+		input = (int)div_s64((s64)entry->kin_acc * 0x7fff, LG4FF_ACC_FULL);
+		break;
+	default:
+		return 0;
+	}
+	input = clamp(input, -0x7fff, 0x7fff);
+
+	dev = input - (int)c->center;
+	half_db = c->deadband / 2;
+	if (dev > half_db)
+		dev -= half_db;
+	else if (dev < -half_db)
+		dev += half_db;
+	else
+		return 0;
+
+	if (dev < 0) {
+		k = c->left_coeff;
+		sat = c->left_saturation / 2;
+	} else {
+		k = c->right_coeff;
+		sat = c->right_saturation / 2;
+	}
+	/* Like the hardware path, the per-type level scales the saturation */
+	sat = sat * level_percent / 100;
+	if (sat == 0)
+		return 0;
+
+	force = (int)div_s64((s64)k * dev, 0x7fff);
+	return clamp(force, -sat, sat);
+}
+
 static __always_inline struct ff_envelope *lg4ff_effect_envelope(struct ff_effect *effect)
 {
 	switch (effect->type) {
@@ -850,7 +973,10 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 
 	memset(parameters, 0, sizeof(parameters));
 
-	gain = (unsigned)entry->wdata.master_gain * (entry->wdata.app_gain ? entry->wdata.gain : 0xffff) / 0xffff;
+	gain = (unsigned)div_u64((u64)entry->wdata.master_gain * (entry->wdata.app_gain ? entry->wdata.gain : 0xffff), 0xffff);
+
+	lg4ff_update_kinematics(entry);
+	entry->sw_conditions = 0;
 
 	spin_lock_irqsave(&entry->timer_lock, flags);
 
@@ -901,6 +1027,9 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 			case FF_SPRING:
 				if (state->slot != 0) {
 					lg4ff_calculate_spring(state, &parameters[state->slot]);
+				} else {
+					parameters[0].level += lg4ff_calculate_condition_sw(entry, state, spring_level);
+					entry->sw_conditions++;
 				}
 				break;
 			case FF_DAMPER:
@@ -908,18 +1037,23 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 			case FF_INERTIA:
 				if (state->slot != 0) {
 					lg4ff_calculate_resistance(state, &parameters[state->slot]);
+				} else {
+					int level = state->effect.type == FF_FRICTION ? friction_level : damper_level;
+
+					parameters[0].level += lg4ff_calculate_condition_sw(entry, state, level);
+					entry->sw_conditions++;
 				}
 		}
 	}
 
 	spin_unlock_irqrestore(&entry->timer_lock, flags);
 
-	parameters[0].level = (long)parameters[0].level * gain / 0xffff;
+	parameters[0].level = lg4ff_apply_gain(parameters[0].level, gain);
 
 	ffb_level = abs(parameters[0].level);
 	for (i = 1; i < 4; i++) {
-		parameters[i].k1 = (long)parameters[i].k1 * gain / 0xffff;
-		parameters[i].k2 = (long)parameters[i].k2 * gain / 0xffff;
+		parameters[i].k1 = lg4ff_apply_gain(parameters[i].k1, gain);
+		parameters[i].k2 = lg4ff_apply_gain(parameters[i].k2, gain);
 		switch (entry->slots[i].effect_type) {
 			case FF_SPRING:
 				parameters[i].clip = parameters[i].clip * spring_level / 100;
@@ -931,7 +1065,7 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 				parameters[i].clip = parameters[i].clip * friction_level / 100;
 				break;
 		}
-		parameters[i].clip = parameters[i].clip * gain / 0xffff;
+		parameters[i].clip = lg4ff_apply_gain(parameters[i].clip, gain);
 		ffb_level += parameters[i].clip * 0x7fff / 0xffff;
 	}
 	if (ffb_level > entry->peak_ffb_level) {
@@ -1114,7 +1248,8 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 					DEBUG("Start timer.");
 			}
 			if ((state->effect.type == FF_SPRING || state->effect.type == FF_DAMPER
-					|| state->effect.type == FF_FRICTION || state->effect.type == FF_INERTIA)
+					|| state->effect.type == FF_FRICTION
+					|| (state->effect.type == FF_INERTIA && !entry->wdata.inertia_mode))
 					&& state->slot == 0) {
 				/* Find a free slot */
 				for (i = 1; i < 4 && entry->slots[i].effect_type != 0; i++);
@@ -1391,6 +1526,7 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 						     .autocenter_persistent = 0,
 						     .app_gain = 1,
 						     .invert_pedals = 0,
+						     .inertia_mode = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
 						     .set_range = wheel->set_range,
@@ -2062,16 +2198,17 @@ static ssize_t lg4ff_gain_store(struct device *dev, struct device_attribute *att
 {
 	struct hid_device *hid = to_hid_device(dev);
 	struct lg4ff_device_entry *entry;
-	u16 gain = simple_strtoul(buf, NULL, 10);
+	u32 gain;
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
 		return -EINVAL;
 	}
 
-	if (gain > 0xffff) {
-		gain = 0xffff;
-	}
+	if (kstrtou32(buf, 10, &gain))
+		return -EINVAL;
+	if (gain > LG4FF_GAIN_MAX)
+		gain = LG4FF_GAIN_MAX;
 
 	entry->wdata.master_gain = gain;
 
@@ -2116,6 +2253,61 @@ static ssize_t lg4ff_app_gain_store(struct device *dev, struct device_attribute 
 	return count;
 }
 static DEVICE_ATTR(app_gain, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_app_gain_show, lg4ff_app_gain_store);
+
+/* How inertia effects are rendered: 0 = as a damper on a hardware slot
+ * (what the Windows driver does), 1 = in software from the measured wheel
+ * acceleration. Takes effect for effects started after the change. */
+static ssize_t lg4ff_inertia_mode_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.inertia_mode);
+}
+
+static ssize_t lg4ff_inertia_mode_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 mode;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &mode) || mode > 1)
+		return -EINVAL;
+
+	entry->wdata.inertia_mode = mode;
+
+	return count;
+}
+static DEVICE_ATTR(inertia_mode, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_inertia_mode_show, lg4ff_inertia_mode_store);
+
+/* Number of condition effects currently rendered in software (no free
+ * hardware slot, or inertia in software mode). Diagnostic. */
+static ssize_t lg4ff_sw_conditions_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->sw_conditions);
+}
+static DEVICE_ATTR(sw_conditions, S_IRUSR | S_IRGRP | S_IROTH, lg4ff_sw_conditions_show, NULL);
 
 /* Export the currently set autocenter of the wheel */
 static ssize_t lg4ff_autocenter_show(struct device *dev, struct device_attribute *attr,
@@ -2736,6 +2928,12 @@ int lg4ff_init(struct hid_device *hid)
 		error = device_create_file(&hid->dev, &dev_attr_app_gain);
 		if (error)
 			hid_warn(hid, "Unable to create sysfs interface for \"app_gain\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_inertia_mode);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"inertia_mode\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_sw_conditions);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"sw_conditions\", errno %d\n", error);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_autocenter);
 			if (error)
@@ -2838,6 +3036,8 @@ int lg4ff_deinit(struct hid_device *hid)
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);
 		device_remove_file(&hid->dev, &dev_attr_app_gain);
+		device_remove_file(&hid->dev, &dev_attr_inertia_mode);
+		device_remove_file(&hid->dev, &dev_attr_sw_conditions);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_autocenter);
 			device_remove_file(&hid->dev, &dev_attr_autocenter_persistent);
