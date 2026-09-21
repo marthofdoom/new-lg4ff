@@ -45,6 +45,14 @@ following ones:
 - SYSFS entries for gain, autocenter, spring/damper/friction effect gain and
   FFBmeter.
 
+## Install from a package
+
+- Debian / Ubuntu / Proxmox: `new-lg4ff-dkms_<version>_all.deb` from the
+  [releases](https://github.com/berarma/new-lg4ff/releases)
+  (`sudo apt install ./new-lg4ff-dkms_*.deb`; needs your kernel's headers).
+- Arch: `packaging/arch/PKGBUILD`.
+- Fedora / RPM: `packaging/rpm/new-lg4ff.spec`.
+
 ## Requirements
 
 - GMake

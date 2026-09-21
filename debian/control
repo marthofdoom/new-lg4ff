@@ -1,0 +1,24 @@
+Source: new-lg4ff
+Section: kernel
+Priority: optional
+Maintainer: marth <marthofdoom@gmail.com>
+Build-Depends: debhelper-compat (= 13)
+Standards-Version: 4.6.2
+Homepage: https://github.com/marthofdoom/new-lg4ff
+Rules-Requires-Root: no
+
+Package: new-lg4ff-dkms
+Architecture: all
+Depends: dkms, ${misc:Depends}
+Recommends: linux-headers-generic | linux-headers-amd64 | pve-headers
+Provides: hid-logitech-new
+Description: improved Logitech wheel force feedback driver (DKMS)
+ Replacement for the in-kernel hid-logitech module for Logitech steering
+ wheels (G29, G27, G25, G923 PS, Driving Force GT/Pro, MOMO, ...): all Linux
+ force feedback effect types rendered at 500 Hz, software-rendered condition
+ effects when the hardware slots are full, real friction and rumble on the
+ G29, steering sensitivity curve, persistent centering spring, gain up to
+ 150 %, and sysfs controls for everything (used by Oversteer).
+ .
+ The module is built for each installed kernel through DKMS and replaces
+ hid-logitech.
