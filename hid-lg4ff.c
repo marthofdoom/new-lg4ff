@@ -14,6 +14,7 @@
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/fixp-arith.h>
+#include <linux/math64.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
@@ -82,9 +83,11 @@
 #define SCALE_COEFF(x, bits) SCALE_VALUE_U16(abs(x) * 2, bits)
 #define TRANSLATE_FORCE(x) ((CLAMP_VALUE_S16(x) + 0x8000) >> 8)
 #define STOP_EFFECT(state) ((state)->flags = 0)
-#define JIFFIES2MS(jiffies) ((jiffies) * 1000 / HZ)
+/* Effect timing in ms from a clock finer than jiffies (HZ=250 kernels would
+ * otherwise sample fast periodic effects at 4 ms) */
+#define LG4FF_NOW_MS() ((unsigned long)div_u64(ktime_get_ns(), NSEC_PER_MSEC))
 #undef fixp_sin16
-#define fixp_sin16(v) (((v % 360) > 180)? -(fixp_sin32((v % 360) - 180) >> 16) : fixp_sin32(v) >> 16)
+#define fixp_sin16(v) ((((v) % 360) > 180)? -(fixp_sin32(((v) % 360) - 180) >> 16) : fixp_sin32(v) >> 16)
 
 #define DEFAULT_TIMER_PERIOD 2
 #define LG4FF_MAX_EFFECTS 16
@@ -775,7 +778,11 @@ static __always_inline void lg4ff_update_state(struct lg4ff_effect_state *state,
 
 	state->slope = 0;
 	if (effect->type == FF_RAMP && effect->replay.length) {
-		state->slope = ((effect->u.ramp.end_level - effect->u.ramp.start_level) << 16) / (effect->replay.length - state->envelope->attack_length - state->envelope->fade_length);
+		int ramp_length = (int)effect->replay.length - (int)state->envelope->attack_length - (int)state->envelope->fade_length;
+
+		/* attack + fade may cover the whole effect (ff-core doesn't check) */
+		if (ramp_length > 0)
+			state->slope = ((effect->u.ramp.end_level - effect->u.ramp.start_level) << 16) / ramp_length;
 	}
 
 	if (!test_bit(FF_EFFECT_PLAYING, &state->flags) && time_after_eq(now,
@@ -800,8 +807,7 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 	struct lg4ff_slot *slot;
 	struct lg4ff_effect_state *state;
 	struct lg4ff_effect_parameters parameters[4];
-	unsigned long jiffies_now = jiffies;
-	unsigned long now = JIFFIES2MS(jiffies_now);
+	unsigned long now = LG4FF_NOW_MS();
 	unsigned long flags;
 	unsigned gain;
 	int current_period;
@@ -1031,7 +1037,7 @@ static int lg4ff_upload_effect(struct input_dev *dev, struct ff_effect *effect, 
 	struct hid_device *hid = input_get_drvdata(dev);
 	struct lg4ff_device_entry *entry;
 	struct lg4ff_effect_state *state;
-	unsigned long now = JIFFIES2MS(jiffies);
+	unsigned long now = LG4FF_NOW_MS();
 	unsigned long flags;
 
 	entry = lg4ff_get_device_entry(hid);
@@ -1068,7 +1074,7 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 	struct hid_device *hid = input_get_drvdata(dev);
 	struct lg4ff_device_entry *entry;
 	struct lg4ff_effect_state *state;
-	unsigned long now = JIFFIES2MS(jiffies);
+	unsigned long now = LG4FF_NOW_MS();
 	unsigned long flags;
 	int i;
 
@@ -2460,6 +2466,10 @@ int lg4ff_init(struct hid_device *hid)
 			hid_warn(hid, "Unable to create sysfs interface for \"ffb_leds\", errno %d\n", error);
 	}
 #endif
+
+	spring_level = clamp(spring_level, 0, 100);
+	damper_level = clamp(damper_level, 0, 100);
+	friction_level = clamp(friction_level, 0, 100);
 
 	dbg_hid("sysfs interface created\n");
 
