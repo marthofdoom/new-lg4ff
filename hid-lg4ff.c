@@ -110,7 +110,9 @@
  * the hardware damper at full coefficient at ~1/4 of the range per second. */
 #define LG4FF_SPRING_GAIN 16
 #define LG4FF_VEL_FULL 16384
-#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 10)
+#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 20)
+#define LG4FF_KIN_HISTORY 8		/* acceleration baseline: velocity 8 ticks ago */
+#define LG4FF_KIN_RESYNC_NS (100 * NSEC_PER_MSEC)	/* gap after which kinematics restart */
 #define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */
 
 #define FF_EFFECT_STARTED 0
@@ -165,6 +167,7 @@ struct lg4ff_wheel_data {
 	u16 gain;
 	u16 sensitivity;
 	u16 autocenter_persistent;
+	u16 user_autocenter;
 	u16 app_gain;
 	u16 invert_pedals;
 	u16 inertia_mode;	/* 0: as damper (Windows), 1: rendered in software */
@@ -208,6 +211,9 @@ struct lg4ff_device_entry {
 	s32 kin_pos;
 	s32 kin_vel;
 	s32 kin_acc;
+	s32 kin_vel_hist[LG4FF_KIN_HISTORY];
+	u64 kin_time_hist[LG4FF_KIN_HISTORY];
+	unsigned kin_hist_idx;
 	int kin_valid;
 	unsigned sw_conditions;		/* effects rendered in software this tick */
 #ifdef CONFIG_LEDS_CLASS
@@ -782,8 +788,10 @@ static __always_inline int lg4ff_apply_gain(int value, unsigned gain)
 static __always_inline void lg4ff_update_kinematics(struct lg4ff_device_entry *entry)
 {
 	u64 t = ktime_get_ns();
-	s32 min, max, half, pos, vel, acc;
-	u32 dt_us;
+	u64 dt_ns, span_ns;
+	s32 min, max, half, pos, vel, acc, old_vel;
+	s64 tmp;
+	unsigned i;
 
 	if (!test_bit(ABS_X, &entry->axis_seen)) {
 		entry->kin_valid = 0;
@@ -798,24 +806,45 @@ static __always_inline void lg4ff_update_kinematics(struct lg4ff_device_entry *e
 	}
 	pos = (s32)div_s64((s64)(entry->axis_raw[ABS_X] - min - half) * 0x7fff, half);
 
-	if (!entry->kin_valid) {
+	dt_ns = t - entry->kin_time;
+	if (!entry->kin_valid || dt_ns > LG4FF_KIN_RESYNC_NS) {
+		/* First tick, or the timer was stopped for a while: re-seed */
 		entry->kin_time = t;
 		entry->kin_pos = pos;
 		entry->kin_vel = 0;
 		entry->kin_acc = 0;
+		for (i = 0; i < LG4FF_KIN_HISTORY; i++) {
+			entry->kin_vel_hist[i] = 0;
+			entry->kin_time_hist[i] = t;
+		}
+		entry->kin_hist_idx = 0;
 		entry->kin_valid = 1;
 		return;
 	}
-	dt_us = (u32)div_u64(t - entry->kin_time, 1000);
-	if (dt_us < 500)
+	if (dt_ns < 500 * NSEC_PER_USEC)
 		return;
 	entry->kin_time = t;
-	vel = (s32)div_s64((s64)(pos - entry->kin_pos) * 1000000, dt_us);
-	acc = (s32)div_s64((s64)(vel - entry->kin_vel) * 1000000, dt_us);
+
+	/* Velocity in s16 units per second, lightly smoothed: the position is
+	 * quantised and reports are not phase locked to the timer. */
+	tmp = div_s64((s64)(pos - entry->kin_pos) * NSEC_PER_SEC, dt_ns);
+	vel = (s32)clamp_t(s64, tmp, -0x7fffffff, 0x7fffffff);
 	entry->kin_pos = pos;
-	/* Light smoothing: the position is quantised and reports are bursty */
 	entry->kin_vel += (vel - entry->kin_vel) / 4;
-	entry->kin_acc += (acc - entry->kin_acc) / 8;
+
+	/* Acceleration from the smoothed velocity over a longer baseline so a
+	 * one count wobble between ticks doesn't register as a jerk. */
+	i = entry->kin_hist_idx;
+	old_vel = entry->kin_vel_hist[i];
+	span_ns = t - entry->kin_time_hist[i];
+	entry->kin_vel_hist[i] = entry->kin_vel;
+	entry->kin_time_hist[i] = t;
+	entry->kin_hist_idx = (i + 1) % LG4FF_KIN_HISTORY;
+	if (span_ns < NSEC_PER_MSEC)
+		return;
+	tmp = div_s64((s64)(entry->kin_vel - old_vel) * NSEC_PER_SEC, span_ns);
+	acc = (s32)clamp_t(s64, tmp, -0x7fffffff, 0x7fffffff);
+	entry->kin_acc += (acc - entry->kin_acc) / 4;
 }
 
 /* Render a condition effect in software. Used for inertia (when enabled)
@@ -825,11 +854,17 @@ static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entr
 {
 	struct ff_condition_effect *c = &state->effect.u.condition[0];
 	int input, dev, k, sat, force, half_db, mult = 1;
+	u16 type = state->effect.type;
 
 	if (!entry->kin_valid)
 		return 0;
 
-	switch (state->effect.type) {
+	/* Inertia is played as a damper unless true inertia is enabled, like
+	 * the hardware-slot cast. */
+	if (type == FF_INERTIA && !entry->wdata.inertia_mode)
+		type = FF_DAMPER;
+
+	switch (type) {
 	case FF_SPRING:
 		input = entry->kin_pos;
 		mult = LG4FF_SPRING_GAIN;
@@ -1247,6 +1282,7 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 		} else {
 			entry->effects_used++;
 			if (!hrtimer_active(&entry->hrtimer)) {
+				entry->kin_valid = 0;	/* re-seed kinematics for the new session */
 				hrtimer_start(&entry->hrtimer, ms_to_ktime(timer_msecs), HRTIMER_MODE_REL);
 				if (unlikely(profile))
 					DEBUG("Start timer.");
@@ -1417,7 +1453,7 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 	__set_bit(usage->code, &entry->axis_seen);
 
 	new_value = lg4ff_adjust_axis(entry, usage->code, value);
-	if (new_value == value && usage->code != ABS_X)
+	if (new_value == value && entry->wdata.product_id != USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
 		return 0;
 
 	input_event(field->hidinput->input, usage->type, usage->code, new_value);
@@ -2348,6 +2384,9 @@ static ssize_t lg4ff_autocenter_store(struct device *dev, struct device_attribut
 		return -EINVAL;
 	}
 
+	/* The flag is briefly global: an application write racing this store
+	 * on another CPU may slip through once; the next store fixes it. */
+	entry->wdata.user_autocenter = autocenter;
 	entry->autocenter_from_user = 1;
 	inputdev->ff->set_autocenter(inputdev, autocenter);
 	entry->autocenter_from_user = 0;
@@ -2393,7 +2432,7 @@ static ssize_t lg4ff_autocenter_persistent_store(struct device *dev, struct devi
 	if (persistent) {
 		/* Re-apply the user's value in case an application had changed it */
 		entry->autocenter_from_user = 1;
-		inputdev->ff->set_autocenter(inputdev, entry->wdata.autocenter);
+		inputdev->ff->set_autocenter(inputdev, entry->wdata.user_autocenter);
 		entry->autocenter_from_user = 0;
 	}
 

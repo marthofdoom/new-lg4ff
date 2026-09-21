@@ -122,12 +122,35 @@ def main():
         drain(dev, 0.1)
         ok &= check(read(sysdir, 'sw_conditions') == '1', "three hardware slots still available beside software inertia")
         stop_all()
+        # True inertia must not turn quantisation noise into force: under a gentle
+        # push the peak must stay near the push itself, far from saturation.
+        saved['damper_level'] = read(sysdir, 'damper_level')
+        write(sysdir, 'damper_level', 100)
+        write(sysdir, 'autocenter', 30000); drain(dev, 1.2); write(sysdir, 'autocenter', 0); drain(dev, 0.3)
+        start(condition(ecodes.FF_INERTIA, 0x7fff, 0xffff))
+        drain(dev, 0.2)
+        write(sysdir, 'peak_ffb_level', 0)
+        start(constant(8000, 600)); drain(dev, 0.9); playing.pop()
+        peak = int(read(sysdir, 'peak_ffb_level'))
+        stop_all()
+        write(sysdir, 'damper_level', saved['damper_level'])
+        ok &= check(peak < 20000, "software inertia under a 24 % push: peak {} (noise would saturate at ~40000)".format(peak))
         write(sysdir, 'inertia_mode', 0)
         drain(dev, 0.1)
         start(condition(ecodes.FF_INERTIA, 0x7fff, 0xffff))
         drain(dev, 0.1)
         ok &= check(read(sysdir, 'sw_conditions') == '0', "inertia_mode=0: inertia takes a hardware slot (as damper)")
         stop_all()
+        # A 4th inertia effect with inertia_mode=0 must still behave as a damper in software
+        for _ in range(3):
+            start(condition(ecodes.FF_DAMPER, 0x7fff, 0))
+        start(condition(ecodes.FF_INERTIA, 0x7fff, 0xffff))
+        drain(dev, 0.2)
+        write(sysdir, 'peak_ffb_level', 0)
+        start(constant(8000, 600)); drain(dev, 0.9); playing.pop()
+        peak = int(read(sysdir, 'peak_ffb_level'))
+        stop_all()
+        ok &= check(read(sysdir, 'sw_conditions') == '0' and peak < 20000, "overflow inertia with inertia_mode=0 rendered as damper (peak {})".format(peak))
 
         print("friction on a wheel without hardware friction (G29/G923) is rendered in software")
         if os.path.exists(os.path.join(sysdir, 'friction_level')):
