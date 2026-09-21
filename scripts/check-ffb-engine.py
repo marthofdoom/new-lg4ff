@@ -123,6 +123,30 @@ def main():
         ok &= check(read(sysdir, 'sw_conditions') == '0', "inertia_mode=0: inertia takes a hardware slot (as damper)")
         stop_all()
 
+        print("friction on a wheel without hardware friction (G29/G923) is rendered in software")
+        if os.path.exists(os.path.join(sysdir, 'friction_level')):
+            saved['friction_level'] = read(sysdir, 'friction_level')
+            write(sysdir, 'friction_level', 100)
+            start(condition(ecodes.FF_FRICTION, 0x7fff, 0xffff))
+            drain(dev, 0.1)
+            sw = read(sysdir, 'sw_conditions')
+            print("  sw_conditions = {} (1 on G29/G923, 0 on wheels with hardware friction)".format(sw))
+            # Motion check: with full friction a weak push should barely move the wheel
+            write(sysdir, 'autocenter', 30000); drain(dev, 1.5); write(sysdir, 'autocenter', 0); drain(dev, 0.2)
+            p0 = pos(dev)
+            start(constant(-8000, 400)); drain(dev, 0.7); playing.pop()
+            moved_with = abs(pos(dev) - p0)
+            stop_all()
+            write(sysdir, 'autocenter', 30000); drain(dev, 1.5); write(sysdir, 'autocenter', 0); drain(dev, 0.2)
+            p0 = pos(dev)
+            start(constant(-8000, 400)); drain(dev, 0.7); playing.pop()
+            moved_without = abs(pos(dev) - p0)
+            stop_all()
+            print("  24 % push moved the wheel {} counts with friction, {} without".format(moved_with, moved_without))
+            ok &= check(moved_with < moved_without / 2, "friction resists motion")
+        else:
+            print("  (no friction_level attribute)")
+
         print("gain above 100 %")
         write(sysdir, 'gain', 98303)
         ok &= check(read(sysdir, 'gain') == '98303', "gain accepts 150 % (98303)")

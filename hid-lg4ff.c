@@ -103,11 +103,14 @@
 /* Master gain: 0..LG4FF_GAIN_MAX, 0xffff is 100 % (like LGS, up to 150 %) */
 #define LG4FF_GAIN_MAX 0x17fff
 
-/* Software condition effects: kinematics scale. Position is -0x8000..0x7fff
- * over the wheel's range. Velocity of one full range per second and an
- * acceleration reaching that in 0.1 s map to full scale. */
-#define LG4FF_VEL_FULL 65535
-#define LG4FF_ACC_FULL (65535 * 10)
+/* Software condition effects: kinematics scale, calibrated on a G29 so a
+ * software effect matches the hardware effect with the same coefficients.
+ * Position is -0x8000..0x7fff over the wheel's range; the hardware spring
+ * at full coefficient reaches full force after ~1/16 of the half range,
+ * the hardware damper at full coefficient at ~1/4 of the range per second. */
+#define LG4FF_SPRING_GAIN 16
+#define LG4FF_VEL_FULL 16384
+#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 10)
 #define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */
 
 #define FF_EFFECT_STARTED 0
@@ -821,7 +824,7 @@ static __always_inline void lg4ff_update_kinematics(struct lg4ff_device_entry *e
 static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entry *entry, struct lg4ff_effect_state *state, int level_percent)
 {
 	struct ff_condition_effect *c = &state->effect.u.condition[0];
-	int input, dev, k, sat, force, half_db;
+	int input, dev, k, sat, force, half_db, mult = 1;
 
 	if (!entry->kin_valid)
 		return 0;
@@ -829,6 +832,7 @@ static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entr
 	switch (state->effect.type) {
 	case FF_SPRING:
 		input = entry->kin_pos;
+		mult = LG4FF_SPRING_GAIN;
 		break;
 	case FF_DAMPER:
 		input = (int)div_s64((s64)entry->kin_vel * 0x7fff, LG4FF_VEL_FULL);
@@ -867,7 +871,7 @@ static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entr
 	if (sat == 0)
 		return 0;
 
-	force = (int)div_s64((s64)k * dev, 0x7fff);
+	force = (int)div_s64((s64)k * dev * mult, 0x7fff);
 	return clamp(force, -sat, sat);
 }
 
@@ -1248,7 +1252,7 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 					DEBUG("Start timer.");
 			}
 			if ((state->effect.type == FF_SPRING || state->effect.type == FF_DAMPER
-					|| state->effect.type == FF_FRICTION
+					|| (state->effect.type == FF_FRICTION && (entry->wdata.capabilities & LG4FF_CAP_FRICTION))
 					|| (state->effect.type == FF_INERTIA && !entry->wdata.inertia_mode))
 					&& state->slot == 0) {
 				/* Find a free slot */
@@ -1257,12 +1261,10 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 					state->slot = i;
 					entry->slots[i].effect_type = state->effect.type;
 
-					/* Cast unsupported effect types to "damper": this is what the Windows
-					* driver does.
-					* This is not physically plausible, but we are working with toy-strength
-					* wheels that won't let you feel more than "big value = wheel stuck" */
-					if (state->effect.type == FF_INERTIA
-							|| (state->effect.type == FF_FRICTION && !(entry->wdata.capabilities & LG4FF_CAP_FRICTION))) {
+					/* Inertia is cast to "damper" on a hardware slot: this is what
+					 * the Windows driver does. Friction on wheels without the
+					 * hardware command is rendered in software instead. */
+					if (state->effect.type == FF_INERTIA) {
 						entry->slots[i].effect_type = FF_DAMPER;
 					}
 				}
@@ -2955,7 +2957,7 @@ int lg4ff_init(struct hid_device *hid)
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"damper_level\", errno %d\n", error);
 		}
-		if (test_bit(FF_FRICTION, dev->ffbit) && (entry->wdata.capabilities & LG4FF_CAP_FRICTION)) {
+		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_friction_level);
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"friction_level\", errno %d\n", error);
@@ -3049,8 +3051,7 @@ int lg4ff_deinit(struct hid_device *hid)
 		if (test_bit(FF_DAMPER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_damper_level);
 		}
-		if (test_bit(FF_FRICTION, dev->ffbit)
-				&& (entry->wdata.capabilities & LG4FF_CAP_FRICTION)) {
+		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_friction_level);
 		}
 	}
