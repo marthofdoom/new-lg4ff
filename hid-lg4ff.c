@@ -181,11 +181,13 @@ struct lg4ff_device_entry {
 	unsigned peak_ffb_level;
 	int effects_used;
 	int autocenter_from_user;
-	struct input_dev *x_axis_dev;
-	s32 x_axis_raw;
-	s32 x_axis_min;
-	s32 x_axis_max;
-	int x_axis_seen;
+	/* Last raw value and limits of ABS_X..ABS_RZ, so a setting change can
+	 * be applied without waiting for the wheel to report again */
+	struct input_dev *axis_dev;
+	s32 axis_raw[ABS_RZ + 1];
+	s32 axis_min[ABS_RZ + 1];
+	s32 axis_max[ABS_RZ + 1];
+	unsigned long axis_seen;
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -1217,6 +1219,33 @@ static s32 lg4ff_apply_sensitivity(s32 value, s32 min, s32 max, u16 sensitivity)
 	return min_t(s32, max, centre + (s32)out);
 }
 
+/* Apply the user settings (sensitivity curve, pedal inversion) to a raw
+ * axis value. `value` for ABS_X is after the DFP range correction. */
+static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code, s32 value)
+{
+	u16 bit;
+
+	switch (code) {
+	case ABS_X:
+		return lg4ff_apply_sensitivity(value, entry->axis_min[code], entry->axis_max[code],
+					       entry->wdata.sensitivity);
+	case ABS_Y:
+		bit = LG4FF_INVERT_ABS_Y;
+		break;
+	case ABS_Z:
+		bit = LG4FF_INVERT_ABS_Z;
+		break;
+	case ABS_RZ:
+		bit = LG4FF_INVERT_ABS_RZ;
+		break;
+	default:
+		return value;
+	}
+	if (entry->wdata.invert_pedals & bit)
+		return entry->axis_max[code] + entry->axis_min[code] - value;
+	return value;
+}
+
 int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 			     struct hid_usage *usage, s32 value, struct lg_drv_data *drv_data)
 {
@@ -1228,49 +1257,44 @@ int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 		return 0;
 	}
 
-	if (usage->type != EV_ABS)
+	if (usage->type != EV_ABS || usage->code > ABS_RZ)
 		return 0;
 
 	switch (usage->code) {
 	case ABS_X:
+		if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
+			value = lg4ff_adjust_dfp_x_axis(value, entry->wdata.range);
 		break;
 	case ABS_Y:
 	case ABS_Z:
 	case ABS_RZ:
-		{
-			u16 bit = usage->code == ABS_Y ? LG4FF_INVERT_ABS_Y :
-				  usage->code == ABS_Z ? LG4FF_INVERT_ABS_Z : LG4FF_INVERT_ABS_RZ;
-
-			if (!(entry->wdata.invert_pedals & bit))
-				return 0;
-			input_event(field->hidinput->input, usage->type, usage->code,
-				    field->logical_maximum + field->logical_minimum - value);
-			return 1;
-		}
+		break;
 	default:
 		return 0;
 	}
 
-	new_value = value;
-	if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
-		new_value = lg4ff_adjust_dfp_x_axis(new_value, entry->wdata.range);
+	entry->axis_dev = field->hidinput->input;
+	entry->axis_raw[usage->code] = value;
+	entry->axis_min[usage->code] = field->logical_minimum;
+	entry->axis_max[usage->code] = field->logical_maximum;
+	__set_bit(usage->code, &entry->axis_seen);
 
-	/* Remembered so a sensitivity change can be applied without waiting
-	 * for the wheel to move */
-	entry->x_axis_dev = field->hidinput->input;
-	entry->x_axis_raw = new_value;
-	entry->x_axis_min = field->logical_minimum;
-	entry->x_axis_max = field->logical_maximum;
-	entry->x_axis_seen = 1;
-
-	new_value = lg4ff_apply_sensitivity(new_value, field->logical_minimum,
-					    field->logical_maximum, entry->wdata.sensitivity);
-
-	if (new_value == value)
+	new_value = lg4ff_adjust_axis(entry, usage->code, value);
+	if (new_value == value && usage->code != ABS_X)
 		return 0;
 
 	input_event(field->hidinput->input, usage->type, usage->code, new_value);
 	return 1;
+}
+
+/* Re-emit an axis through the current settings (after a sysfs change) */
+static void lg4ff_reemit_axis(struct lg4ff_device_entry *entry, unsigned int code)
+{
+	if (!entry->axis_dev || !test_bit(code, &entry->axis_seen))
+		return;
+	input_event(entry->axis_dev, EV_ABS, code,
+		    lg4ff_adjust_axis(entry, code, entry->axis_raw[code]));
+	input_sync(entry->axis_dev);
 }
 
 int lg4ff_raw_event(struct hid_device *hdev, struct hid_report *report,
@@ -1897,6 +1921,9 @@ static ssize_t lg4ff_invert_pedals_store(struct device *dev, struct device_attri
 		return -EINVAL;
 
 	entry->wdata.invert_pedals = mask;
+	lg4ff_reemit_axis(entry, ABS_Y);
+	lg4ff_reemit_axis(entry, ABS_Z);
+	lg4ff_reemit_axis(entry, ABS_RZ);
 
 	return count;
 }
@@ -1978,14 +2005,7 @@ static ssize_t lg4ff_sensitivity_store(struct device *dev, struct device_attribu
 		return -EINVAL;
 
 	entry->wdata.sensitivity = sensitivity;
-
-	/* Re-emit the current position through the new curve */
-	if (entry->x_axis_seen) {
-		input_event(entry->x_axis_dev, EV_ABS, ABS_X,
-			    lg4ff_apply_sensitivity(entry->x_axis_raw, entry->x_axis_min,
-						    entry->x_axis_max, sensitivity));
-		input_sync(entry->x_axis_dev);
-	}
+	lg4ff_reemit_axis(entry, ABS_X);
 
 	return count;
 }

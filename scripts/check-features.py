@@ -96,6 +96,35 @@ def main():
     ok &= check(peak_honoured == 0, "app_gain=1: FF_GAIN 0 silences effect (peak {})".format(peak_honoured))
     ok &= check(2500 <= peak_ignored <= 4000, "app_gain=0: FF_GAIN 0 ignored, effect plays (peak {})".format(peak_ignored))
 
+    print("invert pedals (nudges the wheel once so every axis has reported)")
+    if not os.path.exists(os.path.join(sysdir, 'invert_pedals')):
+        ok &= check(False, "invert_pedals attribute present")
+    else:
+        def drain(seconds):
+            t0 = time.time()
+            while time.time() - t0 < seconds:
+                if dev.read_one() is None:
+                    time.sleep(0.005)
+        write(sysdir, 'invert_pedals', 0)
+        nudge = ff.Effect(ecodes.FF_CONSTANT, -1, 0x4000, ff.Trigger(0, 0), ff.Replay(150, 0),
+                          ff.EffectType(ff_constant_effect=ff.Constant(level=9000)))
+        nid = dev.upload_effect(nudge)
+        dev.write(ecodes.EV_FF, nid, 1)
+        drain(1.5)
+        dev.erase_effect(nid)
+        axes = {ecodes.ABS_Y: 1, ecodes.ABS_Z: 2, ecodes.ABS_RZ: 4}
+        raw = {code: dev.absinfo(code) for code in axes}
+        for mask in (7, 2, 0):
+            write(sysdir, 'invert_pedals', mask)
+            drain(0.3)
+            for code, bit in axes.items():
+                info = raw[code]
+                expected = (info.max + info.min - info.value) if mask & bit else info.value
+                got = dev.absinfo(code).value
+                ok &= check(got == expected, "mask {}: {} raw {} -> {} (expected {})".format(
+                    mask, ecodes.ABS[code], info.value, got, expected))
+        ok &= check(read(sysdir, 'invert_pedals') == '0', "invert_pedals back to 0")
+
     print("\nALL OK" if ok else "\nFAILURES")
     return 0 if ok else 1
 
