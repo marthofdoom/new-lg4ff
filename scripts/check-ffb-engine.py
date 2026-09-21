@@ -91,16 +91,22 @@ def main():
         drain(dev, 0.1)
         ok &= check(read(sysdir, 'sw_conditions') == '1', "4th condition effect rendered in software")
 
-        # The software spring must pull the wheel back to centre after a push
+        # The software spring must hold a push like the hardware spring does and
+        # pull the wheel back afterwards. Start from centre (hardware autocenter),
+        # full spring level so the push stays below saturation.
         centre = 32768
-        push = start(constant(9000, 350))
-        drain(dev, 0.5)
+        saved['spring_level'] = read(sysdir, 'spring_level')
+        write(sysdir, 'spring_level', 100)
+        write(sysdir, 'autocenter', 30000); drain(dev, 1.2); write(sysdir, 'autocenter', 0); drain(dev, 0.3)
+        push = start(constant(12000, 700))
+        drain(dev, 0.55)                            # sample while the push is still on
         displaced = pos(dev)
         drain(dev, 1.5)
         returned = pos(dev)
         print("  wheel: pushed to {:+} from centre, spring returned it to {:+}".format(displaced - centre, returned - centre))
-        ok &= check(abs(displaced - centre) > 1500, "push moved the wheel")
-        ok &= check(abs(returned - centre) < abs(displaced - centre) / 3, "software spring re-centred the wheel")
+        ok &= check(200 < abs(displaced - centre) < 3000, "software spring held a 37 % push within hardware-like deflection (hardware: ~800)")
+        ok &= check(abs(returned - centre) < 600, "software spring re-centred the wheel (gearbox stiction allows a few hundred counts)")
+        write(sysdir, 'spring_level', saved['spring_level'])
         stop_all()
         drain(dev, 0.2)
         ok &= check(read(sysdir, 'sw_conditions') == '0', "software effects released")
