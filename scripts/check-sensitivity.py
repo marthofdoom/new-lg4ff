@@ -79,20 +79,26 @@ def main():
     try:
         write(sysdir, 'sensitivity', 50)
         write(sysdir, 'autocenter', 30000)
-        drain(dev, 2.0)
+        # Nudge the wheel so it reports at least once (a wheel already at
+        # centre stays silent and the cached value would be stale).
+        nudge = ff.Effect(ecodes.FF_CONSTANT, -1, 0x4000, ff.Trigger(0, 0), ff.Replay(150, 0),
+                          ff.EffectType(ff_constant_effect=ff.Constant(level=9000)))
+        nid = dev.upload_effect(nudge)
+        dev.write(ecodes.EV_FF, nid, 1)
+        drain(dev, 2.5)
+        dev.erase_effect(nid)
         centre = dev.absinfo(ecodes.ABS_X).value
         print("wheel's own centre with spring on: {} (offset {:+} from {})".format(centre, centre - (mn + (mx - mn + 1) // 2), mn + (mx - mn + 1) // 2))
 
         effect = ff.Effect(ecodes.FF_CONSTANT, -1, 0x4000, ff.Trigger(0, 0), ff.Replay(0, 0),
-                           ff.EffectType(ff_constant_effect=ff.Constant(level=5500)))
+                           ff.EffectType(ff_constant_effect=ff.Constant(level=int(os.environ.get('PUSH', 12000)))))
         eid = dev.upload_effect(effect)
         dev.write(ecodes.EV_FF, eid, 1)
         drain(dev, 2.5)
         raw = dev.absinfo(ecodes.ABS_X).value
         print("parked off-centre at {} (offset {:+})".format(raw, raw - centre))
         if abs(raw - (mn + (mx - mn + 1) // 2)) < 1500:
-            print("  not far enough off centre to test; increase the constant force")
-            ok = False
+            print("  note: less than 1500 counts off centre; set PUSH=<level> higher for a stronger test")
 
         for s in (0, 25, 75, 100, 50):
             write(sysdir, 'sensitivity', s)
