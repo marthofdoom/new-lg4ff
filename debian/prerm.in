@@ -1,0 +1,11 @@
+#!/bin/sh
+set -e
+NAME=new-lg4ff
+VERSION=#VERSION#
+case "$1" in
+    remove|upgrade|deconfigure)
+        dkms remove -m "$NAME" -v "$VERSION" --all || true
+        ;;
+esac
+#DEBHELPER#
+exit 0

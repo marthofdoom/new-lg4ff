@@ -60,6 +60,14 @@ following ones:
 - `invert_pedals`: per-axis pedal inversion (bit mask: 1 = ABS_Y, 2 = ABS_Z,
   4 = ABS_RZ) so pedals report 0 when released like gamepad triggers.
 
+## Install from a package
+
+- Debian / Ubuntu / Proxmox: `new-lg4ff-dkms_<version>_all.deb` from the
+  [releases](https://github.com/marthofdoom/new-lg4ff/releases)
+  (`sudo apt install ./new-lg4ff-dkms_*.deb`; needs your kernel's headers).
+- Arch: `packaging/arch/PKGBUILD`.
+- Fedora / RPM: `packaging/rpm/new-lg4ff.spec`.
+
 ## Requirements
 
 - GMake

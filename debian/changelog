@@ -1,0 +1,5 @@
+new-lg4ff (0.7.0) unstable; urgency=medium
+
+  * Rumble emulation, ktime effect clock, review fixes (see CHANGELOG.md).
+
+ -- marth <marthofdoom@gmail.com>  Mon, 21 Sep 2026 00:30:00 +0000
