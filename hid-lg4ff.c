@@ -30,6 +30,10 @@
 /* Device has a "friction" effect in firmware */
 #define LG4FF_CAP_FRICTION 1
 
+/* Steering sensitivity: 0..100, 50 is a linear response */
+#define LG4FF_SENSITIVITY_LINEAR 50
+#define LG4FF_SENSITIVITY_MAX 100
+
 /* invert_pedals bit mask, by evdev axis */
 #define LG4FF_INVERT_ABS_Y BIT(0)
 #define LG4FF_INVERT_ABS_Z BIT(1)
@@ -145,6 +149,7 @@ struct lg4ff_wheel_data {
 	u16 autocenter;
 	u16 master_gain;
 	u16 gain;
+	u16 sensitivity;
 	u16 invert_pedals;
 	const u16 min_range;
 	const u16 max_range;
@@ -1168,13 +1173,59 @@ static s32 lg4ff_adjust_dfp_x_axis(s32 value, u16 range)
 		return new_value;
 }
 
-/* Apply the user settings (pedal inversion) to a raw axis value. `value`
- * for ABS_X is after the DFP range correction. */
+/* Steering sensitivity curve, matching the Logitech Windows software:
+ * 50 is linear, lower values soften the response around the centre (blend
+ * towards a quadratic curve), higher values sharpen it (blend towards a
+ * square root curve). Full lock is preserved at both ends. Integer only:
+ * every intermediate value fits in 32 bits. */
+static s32 lg4ff_apply_sensitivity(s32 value, s32 min, s32 max, u16 sensitivity)
+{
+	u32 half, ax, curved, mix, out;
+	s32 centre;
+	int negative;
+
+	if (sensitivity == LG4FF_SENSITIVITY_LINEAR || max <= min)
+		return value;
+
+	half = ((u32)(max - min) + 1) / 2;
+	centre = min + half;
+	negative = value < centre;
+	if (negative)
+		ax = centre - value;
+	else
+		ax = value - centre;
+	/* Magnitude scaled to 0..65535; the positive side is one count
+	 * short of a full half range, which costs at most 1 LSB at full lock
+	 * but keeps both sides on the same curve. */
+	ax = ax * 65535 / half;
+	if (ax > 65535)
+		ax = 65535;
+
+	if (sensitivity < LG4FF_SENSITIVITY_LINEAR) {
+		mix = (LG4FF_SENSITIVITY_LINEAR - sensitivity) * 2;
+		curved = ax * ax / 65535;
+	} else {
+		mix = (sensitivity - LG4FF_SENSITIVITY_LINEAR) * 2;
+		curved = int_sqrt(ax * 65535);
+	}
+	out = (ax * (100 - mix) + curved * mix) / 100;
+	out = out * half / 65535;
+
+	if (negative)
+		return max_t(s32, min, centre - (s32)out);
+	return min_t(s32, max, centre + (s32)out);
+}
+
+/* Apply the user settings (sensitivity curve, pedal inversion) to a raw
+ * axis value. `value` for ABS_X is after the DFP range correction. */
 static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code, s32 value)
 {
 	u16 bit;
 
 	switch (code) {
+	case ABS_X:
+		return lg4ff_apply_sensitivity(value, entry->axis_min[code], entry->axis_max[code],
+					       entry->wdata.sensitivity);
 	case ABS_Y:
 		bit = LG4FF_INVERT_ABS_Y;
 		break;
@@ -1333,6 +1384,7 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 		struct lg4ff_wheel_data t_wdata =  { .product_id = wheel->product_id,
 						     .real_product_id = real_product_id,
 						     .combine = 0,
+						     .sensitivity = LG4FF_SENSITIVITY_LINEAR,
 						     .invert_pedals = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
@@ -1906,6 +1958,43 @@ static ssize_t lg4ff_range_store(struct device *dev, struct device_attribute *at
 	return count;
 }
 static DEVICE_ATTR(range, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_range_show, lg4ff_range_store);
+
+/* Export the steering sensitivity (0..100, 50 = linear) */
+static ssize_t lg4ff_sensitivity_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.sensitivity);
+}
+
+static ssize_t lg4ff_sensitivity_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 sensitivity;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &sensitivity) || sensitivity > LG4FF_SENSITIVITY_MAX)
+		return -EINVAL;
+
+	entry->wdata.sensitivity = sensitivity;
+	lg4ff_reemit_axis(entry, ABS_X);
+
+	return count;
+}
+static DEVICE_ATTR(sensitivity, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_sensitivity_show, lg4ff_sensitivity_store);
 
 static ssize_t lg4ff_real_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -2519,6 +2608,9 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_range);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"range\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_sensitivity);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"sensitivity\", errno %d\n", error);
 	error = device_create_file(&hid->dev, &dev_attr_invert_pedals);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"invert_pedals\", errno %d\n", error);
@@ -2628,6 +2720,7 @@ int lg4ff_deinit(struct hid_device *hid)
 
 	device_remove_file(&hid->dev, &dev_attr_combine_pedals);
 	device_remove_file(&hid->dev, &dev_attr_range);
+	device_remove_file(&hid->dev, &dev_attr_sensitivity);
 	device_remove_file(&hid->dev, &dev_attr_invert_pedals);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
