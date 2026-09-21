@@ -14,6 +14,7 @@
 #include <linux/usb.h>
 #include <linux/hid.h>
 #include <linux/fixp-arith.h>
+#include <linux/math64.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
@@ -29,6 +30,16 @@
 
 /* Device has a "friction" effect in firmware */
 #define LG4FF_CAP_FRICTION 1
+
+/* Steering sensitivity: 0..100, 50 is a linear response */
+#define LG4FF_SENSITIVITY_LINEAR 50
+#define LG4FF_SENSITIVITY_MAX 100
+
+/* invert_pedals bit mask, by evdev axis */
+#define LG4FF_INVERT_ABS_Y BIT(0)
+#define LG4FF_INVERT_ABS_Z BIT(1)
+#define LG4FF_INVERT_ABS_RZ BIT(2)
+#define LG4FF_INVERT_ALL (LG4FF_INVERT_ABS_Y | LG4FF_INVERT_ABS_Z | LG4FF_INVERT_ABS_RZ)
 
 #define LG4FF_MODE_NATIVE_IDX 0
 #define LG4FF_MODE_DFEX_IDX 1
@@ -87,7 +98,20 @@
 #define fixp_sin16(v) (((v % 360) > 180)? -(fixp_sin32((v % 360) - 180) >> 16) : fixp_sin32(v) >> 16)
 
 #define DEFAULT_TIMER_PERIOD 2
-#define LG4FF_MAX_EFFECTS 16
+#define LG4FF_MAX_EFFECTS 32
+
+/* Master gain: 0..LG4FF_GAIN_MAX, 0xffff is 100 % (like LGS, up to 150 %) */
+#define LG4FF_GAIN_MAX 0x17fff
+
+/* Software condition effects: kinematics scale, calibrated on a G29 so a
+ * software effect matches the hardware effect with the same coefficients.
+ * Position is -0x8000..0x7fff over the wheel's range; the hardware spring
+ * at full coefficient reaches full force after ~1/16 of the half range,
+ * the hardware damper at full coefficient at ~1/4 of the range per second. */
+#define LG4FF_SPRING_GAIN 16
+#define LG4FF_VEL_FULL 16384
+#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 10)
+#define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */
 
 #define FF_EFFECT_STARTED 0
 #define FF_EFFECT_ALLSET 1
@@ -137,8 +161,13 @@ struct lg4ff_wheel_data {
 	u16 combine;
 	u16 range;
 	u16 autocenter;
-	u16 master_gain;
+	u32 master_gain;
 	u16 gain;
+	u16 sensitivity;
+	u16 autocenter_persistent;
+	u16 app_gain;
+	u16 invert_pedals;
+	u16 inertia_mode;	/* 0: as damper (Windows), 1: rendered in software */
 	const u16 min_range;
 	const u16 max_range;
 #ifdef CONFIG_LEDS_CLASS
@@ -166,6 +195,21 @@ struct lg4ff_device_entry {
 	struct lg4ff_effect_state states[LG4FF_MAX_EFFECTS];
 	unsigned peak_ffb_level;
 	int effects_used;
+	int autocenter_from_user;
+	/* Last raw value and limits of ABS_X..ABS_RZ, so a setting change can
+	 * be applied without waiting for the wheel to report again */
+	struct input_dev *axis_dev;
+	s32 axis_raw[ABS_RZ + 1];
+	s32 axis_min[ABS_RZ + 1];
+	s32 axis_max[ABS_RZ + 1];
+	unsigned long axis_seen;
+	/* Wheel kinematics for software condition effects, s16 scale */
+	u64 kin_time;
+	s32 kin_pos;
+	s32 kin_vel;
+	s32 kin_acc;
+	int kin_valid;
+	unsigned sw_conditions;		/* effects rendered in software this tick */
 #ifdef CONFIG_LEDS_CLASS
 	int has_leds;
 #endif
@@ -726,6 +770,111 @@ static __always_inline void lg4ff_calculate_resistance(struct lg4ff_effect_state
 	parameters->clip = (unsigned)condition->right_saturation;
 }
 
+/* value * gain / 0xffff without overflowing on 32 bit for gains above 100 % */
+static __always_inline int lg4ff_apply_gain(int value, unsigned gain)
+{
+	return (int)div_s64((s64)value * gain, 0xffff);
+}
+
+/* Update position / velocity / acceleration from the last reported wheel
+ * position. Called every timer tick; the position only changes when the
+ * wheel reports, so velocity decays to zero when it stands still. */
+static __always_inline void lg4ff_update_kinematics(struct lg4ff_device_entry *entry)
+{
+	u64 t = ktime_get_ns();
+	s32 min, max, half, pos, vel, acc;
+	u32 dt_us;
+
+	if (!test_bit(ABS_X, &entry->axis_seen)) {
+		entry->kin_valid = 0;
+		return;
+	}
+	min = entry->axis_min[ABS_X];
+	max = entry->axis_max[ABS_X];
+	half = (max - min + 1) / 2;
+	if (half <= 0) {
+		entry->kin_valid = 0;
+		return;
+	}
+	pos = (s32)div_s64((s64)(entry->axis_raw[ABS_X] - min - half) * 0x7fff, half);
+
+	if (!entry->kin_valid) {
+		entry->kin_time = t;
+		entry->kin_pos = pos;
+		entry->kin_vel = 0;
+		entry->kin_acc = 0;
+		entry->kin_valid = 1;
+		return;
+	}
+	dt_us = (u32)div_u64(t - entry->kin_time, 1000);
+	if (dt_us < 500)
+		return;
+	entry->kin_time = t;
+	vel = (s32)div_s64((s64)(pos - entry->kin_pos) * 1000000, dt_us);
+	acc = (s32)div_s64((s64)(vel - entry->kin_vel) * 1000000, dt_us);
+	entry->kin_pos = pos;
+	/* Light smoothing: the position is quantised and reports are bursty */
+	entry->kin_vel += (vel - entry->kin_vel) / 4;
+	entry->kin_acc += (acc - entry->kin_acc) / 8;
+}
+
+/* Render a condition effect in software. Used for inertia (when enabled)
+ * and for effects that didn't get one of the three hardware slots.
+ * Positive result is a force to the left (decreasing ABS_X). */
+static __always_inline int lg4ff_calculate_condition_sw(struct lg4ff_device_entry *entry, struct lg4ff_effect_state *state, int level_percent)
+{
+	struct ff_condition_effect *c = &state->effect.u.condition[0];
+	int input, dev, k, sat, force, half_db, mult = 1;
+
+	if (!entry->kin_valid)
+		return 0;
+
+	switch (state->effect.type) {
+	case FF_SPRING:
+		input = entry->kin_pos;
+		mult = LG4FF_SPRING_GAIN;
+		break;
+	case FF_DAMPER:
+		input = (int)div_s64((s64)entry->kin_vel * 0x7fff, LG4FF_VEL_FULL);
+		break;
+	case FF_FRICTION:
+		/* Constant force opposing motion, ramped in over a small velocity
+		 * window so it doesn't chatter around zero */
+		input = (int)div_s64((s64)entry->kin_vel * 0x7fff, LG4FF_FRICTION_VEL);
+		break;
+	case FF_INERTIA:
+		input = (int)div_s64((s64)entry->kin_acc * 0x7fff, LG4FF_ACC_FULL);
+		break;
+	default:
+		return 0;
+	}
+	input = clamp(input, -0x7fff, 0x7fff);
+
+	dev = input - (int)c->center;
+	half_db = c->deadband / 2;
+	if (dev > half_db)
+		dev -= half_db;
+	else if (dev < -half_db)
+		dev += half_db;
+	else
+		return 0;
+
+	if (dev < 0) {
+		k = c->left_coeff;
+		sat = c->left_saturation / 2;
+	} else {
+		k = c->right_coeff;
+		sat = c->right_saturation / 2;
+	}
+	/* Like the hardware path, the per-type level scales the saturation */
+	sat = sat * level_percent / 100;
+	if (sat == 0)
+		return 0;
+
+	force = (int)div_s64((s64)k * dev * mult, 0x7fff);
+	return clamp(force, -sat, sat);
+}
+
 static __always_inline struct ff_envelope *lg4ff_effect_envelope(struct ff_effect *effect)
 {
 	switch (effect->type) {
@@ -828,7 +977,10 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 
 	memset(parameters, 0, sizeof(parameters));
 
-	gain = (unsigned)entry->wdata.master_gain * entry->wdata.gain / 0xffff;
+	gain = (unsigned)div_u64((u64)entry->wdata.master_gain * (entry->wdata.app_gain ? entry->wdata.gain : 0xffff), 0xffff);
+
+	lg4ff_update_kinematics(entry);
+	entry->sw_conditions = 0;
 
 	spin_lock_irqsave(&entry->timer_lock, flags);
 
@@ -879,6 +1031,9 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 			case FF_SPRING:
 				if (state->slot != 0) {
 					lg4ff_calculate_spring(state, &parameters[state->slot]);
+				} else {
+					parameters[0].level += lg4ff_calculate_condition_sw(entry, state, spring_level);
+					entry->sw_conditions++;
 				}
 				break;
 			case FF_DAMPER:
@@ -886,18 +1041,23 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 			case FF_INERTIA:
 				if (state->slot != 0) {
 					lg4ff_calculate_resistance(state, &parameters[state->slot]);
+				} else {
+					int level = state->effect.type == FF_FRICTION ? friction_level : damper_level;
+
+					parameters[0].level += lg4ff_calculate_condition_sw(entry, state, level);
+					entry->sw_conditions++;
 				}
 		}
 	}
 
 	spin_unlock_irqrestore(&entry->timer_lock, flags);
 
-	parameters[0].level = (long)parameters[0].level * gain / 0xffff;
+	parameters[0].level = lg4ff_apply_gain(parameters[0].level, gain);
 
 	ffb_level = abs(parameters[0].level);
 	for (i = 1; i < 4; i++) {
-		parameters[i].k1 = (long)parameters[i].k1 * gain / 0xffff;
-		parameters[i].k2 = (long)parameters[i].k2 * gain / 0xffff;
+		parameters[i].k1 = lg4ff_apply_gain(parameters[i].k1, gain);
+		parameters[i].k2 = lg4ff_apply_gain(parameters[i].k2, gain);
 		switch (entry->slots[i].effect_type) {
 			case FF_SPRING:
 				parameters[i].clip = parameters[i].clip * spring_level / 100;
@@ -909,7 +1069,7 @@ static __always_inline int lg4ff_timer(struct lg4ff_device_entry *entry)
 				parameters[i].clip = parameters[i].clip * friction_level / 100;
 				break;
 		}
-		parameters[i].clip = parameters[i].clip * gain / 0xffff;
+		parameters[i].clip = lg4ff_apply_gain(parameters[i].clip, gain);
 		ffb_level += parameters[i].clip * 0x7fff / 0xffff;
 	}
 	if (ffb_level > entry->peak_ffb_level) {
@@ -1092,7 +1252,8 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 					DEBUG("Start timer.");
 			}
 			if ((state->effect.type == FF_SPRING || state->effect.type == FF_DAMPER
-					|| state->effect.type == FF_FRICTION || state->effect.type == FF_INERTIA)
+					|| (state->effect.type == FF_FRICTION && (entry->wdata.capabilities & LG4FF_CAP_FRICTION))
+					|| (state->effect.type == FF_INERTIA && !entry->wdata.inertia_mode))
 					&& state->slot == 0) {
 				/* Find a free slot */
 				for (i = 1; i < 4 && entry->slots[i].effect_type != 0; i++);
@@ -1100,12 +1261,10 @@ static int lg4ff_play_effect(struct input_dev *dev, int effect_id, int value)
 					state->slot = i;
 					entry->slots[i].effect_type = state->effect.type;
 
-					/* Cast unsupported effect types to "damper": this is what the Windows
-					* driver does.
-					* This is not physically plausible, but we are working with toy-strength
-					* wheels that won't let you feel more than "big value = wheel stuck" */
-					if (state->effect.type == FF_INERTIA
-							|| (state->effect.type == FF_FRICTION && !(entry->wdata.capabilities & LG4FF_CAP_FRICTION))) {
+					/* Inertia is cast to "damper" on a hardware slot: this is what
+					 * the Windows driver does. Friction on wheels without the
+					 * hardware command is rendered in software instead. */
+					if (state->effect.type == FF_INERTIA) {
 						entry->slots[i].effect_type = FF_DAMPER;
 					}
 				}
@@ -1154,30 +1313,125 @@ static s32 lg4ff_adjust_dfp_x_axis(s32 value, u16 range)
 		return new_value;
 }
 
+/* Steering sensitivity curve, matching the Logitech Windows software:
+ * 50 is linear, lower values soften the response around the centre (blend
+ * towards a quadratic curve), higher values sharpen it (blend towards a
+ * square root curve). Full lock is preserved at both ends. Integer only:
+ * every intermediate value fits in 32 bits. */
+static s32 lg4ff_apply_sensitivity(s32 value, s32 min, s32 max, u16 sensitivity)
+{
+	u32 half, ax, curved, mix, out;
+	s32 centre;
+	int negative;
+
+	if (sensitivity == LG4FF_SENSITIVITY_LINEAR || max <= min)
+		return value;
+
+	half = ((u32)(max - min) + 1) / 2;
+	centre = min + half;
+	negative = value < centre;
+	if (negative)
+		ax = centre - value;
+	else
+		ax = value - centre;
+	/* Magnitude scaled to 0..65535; the positive side is one count
+	 * short of a full half range, which costs at most 1 LSB at full lock
+	 * but keeps both sides on the same curve. */
+	ax = ax * 65535 / half;
+	if (ax > 65535)
+		ax = 65535;
+
+	if (sensitivity < LG4FF_SENSITIVITY_LINEAR) {
+		mix = (LG4FF_SENSITIVITY_LINEAR - sensitivity) * 2;
+		curved = ax * ax / 65535;
+	} else {
+		mix = (sensitivity - LG4FF_SENSITIVITY_LINEAR) * 2;
+		curved = int_sqrt(ax * 65535);
+	}
+	out = (ax * (100 - mix) + curved * mix) / 100;
+	out = out * half / 65535;
+
+	if (negative)
+		return max_t(s32, min, centre - (s32)out);
+	return min_t(s32, max, centre + (s32)out);
+}
+
+/* Apply the user settings (sensitivity curve, pedal inversion) to a raw
+ * axis value. `value` for ABS_X is after the DFP range correction. */
+static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code, s32 value)
+{
+	u16 bit;
+
+	switch (code) {
+	case ABS_X:
+		return lg4ff_apply_sensitivity(value, entry->axis_min[code], entry->axis_max[code],
+					       entry->wdata.sensitivity);
+	case ABS_Y:
+		bit = LG4FF_INVERT_ABS_Y;
+		break;
+	case ABS_Z:
+		bit = LG4FF_INVERT_ABS_Z;
+		break;
+	case ABS_RZ:
+		bit = LG4FF_INVERT_ABS_RZ;
+		break;
+	default:
+		return value;
+	}
+	if (entry->wdata.invert_pedals & bit)
+		return entry->axis_max[code] + entry->axis_min[code] - value;
+	return value;
+}
+
 int lg4ff_adjust_input_event(struct hid_device *hid, struct hid_field *field,
 			     struct hid_usage *usage, s32 value, struct lg_drv_data *drv_data)
 {
 	struct lg4ff_device_entry *entry = drv_data->device_props;
-	s32 new_value = 0;
+	s32 new_value;
 
 	if (!entry) {
 		hid_err(hid, "Device properties not found");
 		return 0;
 	}
 
-	switch (entry->wdata.product_id) {
-	case USB_DEVICE_ID_LOGITECH_DFP_WHEEL:
-		switch (usage->code) {
-		case ABS_X:
-			new_value = lg4ff_adjust_dfp_x_axis(value, entry->wdata.range);
-			input_event(field->hidinput->input, usage->type, usage->code, new_value);
-			return 1;
-		default:
-			return 0;
-		}
+	if (usage->type != EV_ABS || usage->code > ABS_RZ)
+		return 0;
+
+	switch (usage->code) {
+	case ABS_X:
+		if (entry->wdata.product_id == USB_DEVICE_ID_LOGITECH_DFP_WHEEL)
+			value = lg4ff_adjust_dfp_x_axis(value, entry->wdata.range);
+		break;
+	case ABS_Y:
+	case ABS_Z:
+	case ABS_RZ:
+		break;
 	default:
 		return 0;
 	}
+
+	entry->axis_dev = field->hidinput->input;
+	entry->axis_raw[usage->code] = value;
+	entry->axis_min[usage->code] = field->logical_minimum;
+	entry->axis_max[usage->code] = field->logical_maximum;
+	__set_bit(usage->code, &entry->axis_seen);
+
+	new_value = lg4ff_adjust_axis(entry, usage->code, value);
+	if (new_value == value && usage->code != ABS_X)
+		return 0;
+
+	input_event(field->hidinput->input, usage->type, usage->code, new_value);
+	return 1;
+}
+
+/* Re-emit an axis through the current settings (after a sysfs change) */
+static void lg4ff_reemit_axis(struct lg4ff_device_entry *entry, unsigned int code)
+{
+	if (!entry->axis_dev || !test_bit(code, &entry->axis_seen))
+		return;
+	input_event(entry->axis_dev, EV_ABS, code,
+		    lg4ff_adjust_axis(entry, code, entry->axis_raw[code]));
+	input_sync(entry->axis_dev);
 }
 
 int lg4ff_raw_event(struct hid_device *hdev, struct hid_report *report,
@@ -1270,6 +1524,11 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 		struct lg4ff_wheel_data t_wdata =  { .product_id = wheel->product_id,
 						     .real_product_id = real_product_id,
 						     .combine = 0,
+						     .sensitivity = LG4FF_SENSITIVITY_LINEAR,
+						     .autocenter_persistent = 0,
+						     .app_gain = 1,
+						     .invert_pedals = 0,
+						     .inertia_mode = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
 						     .set_range = wheel->set_range,
@@ -1293,6 +1552,11 @@ static void lg4ff_set_autocenter_default(struct input_dev *dev, u16 magnitude)
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
+		return;
+	}
+
+	if (entry->wdata.autocenter_persistent && !entry->autocenter_from_user) {
+		dbg_hid("ignoring application autocenter request, persistent centering spring is on\n");
 		return;
 	}
 
@@ -1358,6 +1622,11 @@ static void lg4ff_set_autocenter_ffex(struct input_dev *dev, u16 magnitude)
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
+		return;
+	}
+
+	if (entry->wdata.autocenter_persistent && !entry->autocenter_from_user) {
+		dbg_hid("ignoring application autocenter request, persistent centering spring is on\n");
 		return;
 	}
 
@@ -1758,6 +2027,46 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
 
+/* Invert pedal axes. Bit mask: 1 = ABS_Y, 2 = ABS_Z, 4 = ABS_RZ, 7 = all.
+ * Inverted pedals report 0 when released, like gamepad triggers. */
+static ssize_t lg4ff_invert_pedals_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.invert_pedals);
+}
+
+static ssize_t lg4ff_invert_pedals_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 mask;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &mask) || mask > LG4FF_INVERT_ALL)
+		return -EINVAL;
+
+	entry->wdata.invert_pedals = mask;
+	lg4ff_reemit_axis(entry, ABS_Y);
+	lg4ff_reemit_axis(entry, ABS_Z);
+	lg4ff_reemit_axis(entry, ABS_RZ);
+
+	return count;
+}
+static DEVICE_ATTR(invert_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_invert_pedals_show, lg4ff_invert_pedals_store);
+
 /* Export the currently set range of the wheel */
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
@@ -1802,6 +2111,43 @@ static ssize_t lg4ff_range_store(struct device *dev, struct device_attribute *at
 	return count;
 }
 static DEVICE_ATTR(range, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_range_show, lg4ff_range_store);
+
+/* Export the steering sensitivity (0..100, 50 = linear) */
+static ssize_t lg4ff_sensitivity_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.sensitivity);
+}
+
+static ssize_t lg4ff_sensitivity_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 sensitivity;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &sensitivity) || sensitivity > LG4FF_SENSITIVITY_MAX)
+		return -EINVAL;
+
+	entry->wdata.sensitivity = sensitivity;
+	lg4ff_reemit_axis(entry, ABS_X);
+
+	return count;
+}
+static DEVICE_ATTR(sensitivity, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_sensitivity_show, lg4ff_sensitivity_store);
 
 static ssize_t lg4ff_real_id_show(struct device *dev, struct device_attribute *attr, char *buf)
 {
@@ -1854,22 +2200,116 @@ static ssize_t lg4ff_gain_store(struct device *dev, struct device_attribute *att
 {
 	struct hid_device *hid = to_hid_device(dev);
 	struct lg4ff_device_entry *entry;
-	u16 gain = simple_strtoul(buf, NULL, 10);
+	u32 gain;
 
 	entry = lg4ff_get_device_entry(hid);
 	if (entry == NULL) {
 		return -EINVAL;
 	}
 
-	if (gain > 0xffff) {
-		gain = 0xffff;
-	}
+	if (kstrtou32(buf, 10, &gain))
+		return -EINVAL;
+	if (gain > LG4FF_GAIN_MAX)
+		gain = LG4FF_GAIN_MAX;
 
 	entry->wdata.master_gain = gain;
 
 	return count;
 }
 static DEVICE_ATTR(gain, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_gain_show, lg4ff_gain_store);
+
+/* Allow applications to adjust the gain (FF_GAIN). When off, only the
+ * sysfs gain applies; the application's value is remembered and used
+ * again once re-enabled. */
+static ssize_t lg4ff_app_gain_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.app_gain);
+}
+
+static ssize_t lg4ff_app_gain_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	bool app_gain;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtobool(buf, &app_gain))
+		return -EINVAL;
+
+	entry->wdata.app_gain = app_gain;
+
+	return count;
+}
+static DEVICE_ATTR(app_gain, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_app_gain_show, lg4ff_app_gain_store);
+
+/* How inertia effects are rendered: 0 = as a damper on a hardware slot
+ * (what the Windows driver does), 1 = in software from the measured wheel
+ * acceleration. Takes effect for effects started after the change. */
+static ssize_t lg4ff_inertia_mode_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.inertia_mode);
+}
+
+static ssize_t lg4ff_inertia_mode_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	u16 mode;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtou16(buf, 10, &mode) || mode > 1)
+		return -EINVAL;
+
+	entry->wdata.inertia_mode = mode;
+
+	return count;
+}
+static DEVICE_ATTR(inertia_mode, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_inertia_mode_show, lg4ff_inertia_mode_store);
+
+/* Number of condition effects currently rendered in software (no free
+ * hardware slot, or inertia in software mode). Diagnostic. */
+static ssize_t lg4ff_sw_conditions_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->sw_conditions);
+}
+static DEVICE_ATTR(sw_conditions, S_IRUSR | S_IRGRP | S_IROTH, lg4ff_sw_conditions_show, NULL);
 
 /* Export the currently set autocenter of the wheel */
 static ssize_t lg4ff_autocenter_show(struct device *dev, struct device_attribute *attr,
@@ -1896,17 +2336,70 @@ static ssize_t lg4ff_autocenter_store(struct device *dev, struct device_attribut
 	struct hid_device *hid = to_hid_device(dev);
 	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
 	struct input_dev *inputdev = hidinput->input;
+	struct lg4ff_device_entry *entry;
 	u16 autocenter = simple_strtoul(buf, NULL, 10);
 
 	if (autocenter > 0xffff) {
 		autocenter = 0xffff;
 	}
 
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	entry->autocenter_from_user = 1;
 	inputdev->ff->set_autocenter(inputdev, autocenter);
+	entry->autocenter_from_user = 0;
 
 	return count;
 }
 static DEVICE_ATTR(autocenter, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_autocenter_show, lg4ff_autocenter_store);
+
+/* Persistent centering spring: when set, applications can't change or
+ * disable the autocenter value set through sysfs. */
+static ssize_t lg4ff_autocenter_persistent_show(struct device *dev, struct device_attribute *attr,
+				char *buf)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	return scnprintf(buf, PAGE_SIZE, "%u\n", entry->wdata.autocenter_persistent);
+}
+
+static ssize_t lg4ff_autocenter_persistent_store(struct device *dev, struct device_attribute *attr,
+				 const char *buf, size_t count)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct hid_input *hidinput = list_entry(hid->inputs.next, struct hid_input, list);
+	struct input_dev *inputdev = hidinput->input;
+	struct lg4ff_device_entry *entry;
+	bool persistent;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL) {
+		return -EINVAL;
+	}
+
+	if (kstrtobool(buf, &persistent))
+		return -EINVAL;
+
+	entry->wdata.autocenter_persistent = persistent;
+	if (persistent) {
+		/* Re-apply the user's value in case an application had changed it */
+		entry->autocenter_from_user = 1;
+		inputdev->ff->set_autocenter(inputdev, entry->wdata.autocenter);
+		entry->autocenter_from_user = 0;
+	}
+
+	return count;
+}
+static DEVICE_ATTR(autocenter_persistent, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_autocenter_persistent_show, lg4ff_autocenter_persistent_store);
 
 static ssize_t lg4ff_spring_level_show(struct device *dev, struct device_attribute *attr,
 				char *buf)
@@ -2415,6 +2908,12 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_range);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"range\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_sensitivity);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"sensitivity\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_invert_pedals);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"invert_pedals\", errno %d\n", error);
 	if (mmode_ret == LG4FF_MMODE_IS_MULTIMODE) {
 		error = device_create_file(&hid->dev, &dev_attr_real_id);
 		if (error)
@@ -2428,10 +2927,22 @@ int lg4ff_init(struct hid_device *hid)
 		error = device_create_file(&hid->dev, &dev_attr_gain);
 		if (error)
 			hid_warn(hid, "Unable to create sysfs interface for \"gain\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_app_gain);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"app_gain\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_inertia_mode);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"inertia_mode\", errno %d\n", error);
+		error = device_create_file(&hid->dev, &dev_attr_sw_conditions);
+		if (error)
+			hid_warn(hid, "Unable to create sysfs interface for \"sw_conditions\", errno %d\n", error);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_autocenter);
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"autocenter\", errno %d\n", error);
+			error = device_create_file(&hid->dev, &dev_attr_autocenter_persistent);
+			if (error)
+				hid_warn(hid, "Unable to create sysfs interface for \"autocenter_persistent\", errno %d\n", error);
 		}
 		error = device_create_file(&hid->dev, &dev_attr_peak_ffb_level);
 		if (error)
@@ -2446,7 +2957,7 @@ int lg4ff_init(struct hid_device *hid)
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"damper_level\", errno %d\n", error);
 		}
-		if (test_bit(FF_FRICTION, dev->ffbit) && (entry->wdata.capabilities & LG4FF_CAP_FRICTION)) {
+		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			error = device_create_file(&hid->dev, &dev_attr_friction_level);
 			if (error)
 				hid_warn(hid, "Unable to create sysfs interface for \"friction_level\", errno %d\n", error);
@@ -2521,11 +3032,17 @@ int lg4ff_deinit(struct hid_device *hid)
 
 	device_remove_file(&hid->dev, &dev_attr_combine_pedals);
 	device_remove_file(&hid->dev, &dev_attr_range);
+	device_remove_file(&hid->dev, &dev_attr_sensitivity);
+	device_remove_file(&hid->dev, &dev_attr_invert_pedals);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);
+		device_remove_file(&hid->dev, &dev_attr_app_gain);
+		device_remove_file(&hid->dev, &dev_attr_inertia_mode);
+		device_remove_file(&hid->dev, &dev_attr_sw_conditions);
 		if (test_bit(FF_AUTOCENTER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_autocenter);
+			device_remove_file(&hid->dev, &dev_attr_autocenter_persistent);
 		}
 		device_remove_file(&hid->dev, &dev_attr_peak_ffb_level);
 		if (test_bit(FF_SPRING, dev->ffbit)) {
@@ -2534,8 +3051,7 @@ int lg4ff_deinit(struct hid_device *hid)
 		if (test_bit(FF_DAMPER, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_damper_level);
 		}
-		if (test_bit(FF_FRICTION, dev->ffbit)
-				&& (entry->wdata.capabilities & LG4FF_CAP_FRICTION)) {
+		if (test_bit(FF_FRICTION, dev->ffbit)) {
 			device_remove_file(&hid->dev, &dev_attr_friction_level);
 		}
 	}

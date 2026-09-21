@@ -44,6 +44,19 @@ following ones:
   applications.
 - SYSFS entries for gain, autocenter, spring/damper/friction effect gain and
   FFBmeter.
+- Steering sensitivity curve (`sensitivity`, 0-100, 50 = linear) like the
+  Logitech Windows software.
+- Persistent centering spring (`autocenter_persistent`): games can't turn the
+  autocenter off.
+- `app_gain`: choose whether games may adjust the force feedback gain.
+- Condition effects beyond the three hardware slots are rendered in software
+  from the measured wheel position instead of being dropped.
+- Optional true inertia (`inertia_mode` 1) rendered from wheel acceleration;
+  the default (0) casts inertia to a damper like the Windows driver.
+- Gain up to 150 % (`gain` up to 98303) with the FFB meter showing clipping.
+- 32 simultaneous effects.
+- `invert_pedals`: per-axis pedal inversion (bit mask: 1 = ABS_Y, 2 = ABS_Z,
+  4 = ABS_RZ) so pedals report 0 when released like gamepad triggers.
 
 ## Requirements
 
