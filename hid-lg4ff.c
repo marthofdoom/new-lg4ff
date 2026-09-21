@@ -110,7 +110,11 @@
  * the hardware damper at full coefficient at ~1/4 of the range per second. */
 #define LG4FF_SPRING_GAIN 16
 #define LG4FF_VEL_FULL 16384
-#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 20)
+/* Inertia: full force at this acceleration. Measured on a G29, full force
+ * accelerates the free wheel at ~245000 s16 units/s^2, so this makes the
+ * virtual mass at maximum coefficient about a quarter of the wheel's own;
+ * more than that and the delayed acceleration feedback oscillates. */
+#define LG4FF_ACC_FULL (LG4FF_VEL_FULL * 80)
 #define LG4FF_KIN_HISTORY 8		/* acceleration baseline: velocity 8 ticks ago */
 #define LG4FF_KIN_RESYNC_NS (100 * NSEC_PER_MSEC)	/* gap after which kinematics restart */
 #define LG4FF_FRICTION_VEL 2000	/* velocity (s16/s) at which friction reaches full force */

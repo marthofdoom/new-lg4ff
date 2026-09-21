@@ -150,7 +150,7 @@ def main():
         start(constant(8000, 600)); drain(dev, 0.9); playing.pop()
         peak = int(read(sysdir, 'peak_ffb_level'))
         stop_all()
-        ok &= check(read(sysdir, 'sw_conditions') == '0' and peak < 20000, "overflow inertia with inertia_mode=0 rendered as damper (peak {})".format(peak))
+        ok &= check(read(sysdir, 'sw_conditions') == '1' and peak < 20000, "overflow inertia with inertia_mode=0 rendered in software as damper (peak {})".format(peak))
 
         print("friction on a wheel without hardware friction (G29/G923) is rendered in software")
         if os.path.exists(os.path.join(sysdir, 'friction_level')):
