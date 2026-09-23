@@ -12,7 +12,7 @@ hardware and the tree builds cleanly. Never tag from a feature branch.
    - `scripts/check-features.py`
    - `scripts/check-sensitivity.py`
    - `scripts/check-ffb-engine.py`
-4. **Fable diff review**: have the Fable model review
+4. **Opus 5.5 diff review**: have Opus 5.5 (`claude-opus-5-5`) review
    `git diff <previous tag>..master` for correctness, concurrency, kernel API
    misuse, 32-bit overflow and behavioural regressions. Fix or consciously
    waive every finding before continuing.
