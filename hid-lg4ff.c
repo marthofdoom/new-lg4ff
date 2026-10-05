@@ -18,6 +18,8 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #include "usbhid/usbhid.h"
 #include "hid-lg.h"
@@ -2199,6 +2201,11 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 		combine = 2;
 
 	entry->wdata.combine = combine;
+	/* Pedal response is off while combined: show pedals at rest the
+	 * new way at once rather than at their next move */
+	lg4ff_reemit_axis(entry, ABS_Y);
+	lg4ff_reemit_axis(entry, ABS_Z);
+	lg4ff_reemit_axis(entry, ABS_RZ);
 	return count;
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
