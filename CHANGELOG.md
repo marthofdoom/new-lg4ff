@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+### Added
+- Pedal response per pedal: `pedal_response_y`, `pedal_response_z` and
+  `pedal_response_rz` set the part of the travel used (a deadzone at the
+  released end, full before the pedal bottoms out) and a sensitivity curve,
+  in pedal-travel terms whichever way the pedal is inverted. Like G HUB's
+  per-pedal sensitivity; asked for upstream as range of motion
+  (oversteer#273).
+
 ## 0.7.0 — 2026-09-20
 
 ### Added
