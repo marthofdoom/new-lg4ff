@@ -59,6 +59,14 @@ following ones:
   wheel; `rumble_level` (0-100, default 50) sets how strong.
 - `invert_pedals`: per-axis pedal inversion (bit mask: 1 = ABS_Y, 2 = ABS_Z,
   4 = ABS_RZ) so pedals report 0 when released like gamepad triggers.
+- `pedal_response_y`, `pedal_response_z`, `pedal_response_rz`: per pedal,
+  "start end sensitivity" in % of the pedal's travel from released
+  (whichever way `invert_pedals` has it): below start the pedal reads
+  released, from end fully pressed, sensitivity 0-100 with 50 linear
+  (lower is softer at the start of travel, higher sharper). "0 100 50"
+  (default) leaves the pedal as it is. Ignored while pedals are combined.
+  A curve on a Y axis the hardware combines itself (compat modes, MOMO,
+  WingMan) bends the combined axis.
 
 ## Install from a package
 

@@ -1,7 +1,7 @@
 %global modname new-lg4ff
 
 Name:           new-lg4ff-dkms
-Version:        0.7.0
+Version:        0.8.0
 Release:        1%{?dist}
 Summary:        Improved Logitech steering wheel force feedback driver (DKMS)
 License:        GPL-2.0-only
@@ -23,6 +23,7 @@ Oversteer). Built for each kernel through DKMS.
 %install
 install -d %{buildroot}/usr/src/%{modname}-%{version}
 install -m644 Makefile Kbuild dkms.conf *.c *.h %{buildroot}/usr/src/%{modname}-%{version}/
+install -Dm644 usbhid/usbhid.h %{buildroot}/usr/src/%{modname}-%{version}/usbhid/usbhid.h
 sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="%{version}"/' %{buildroot}/usr/src/%{modname}-%{version}/dkms.conf
 
 %post
@@ -36,5 +37,8 @@ dkms remove -m %{modname} -v %{version} --all -q || :
 /usr/src/%{modname}-%{version}
 
 %changelog
+* Tue Oct 06 2026 marth <marthofdoom@gmail.com> - 0.8.0-1
+- Per-pedal response curves; DKMS package now ships usbhid/usbhid.h.
+
 * Mon Sep 21 2026 marth <marthofdoom@gmail.com> - 0.7.0-1
 - Rumble emulation, ktime effect clock, review fixes.

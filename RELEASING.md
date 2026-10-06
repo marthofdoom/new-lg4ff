@@ -16,9 +16,10 @@ hardware and the tree builds cleanly. Never tag from a feature branch.
    `git diff <previous tag>..master` for correctness, concurrency, kernel API
    misuse, 32-bit overflow and behavioural regressions. Fix or consciously
    waive every finding before continuing.
-5. Bump the version in `dkms.conf` (`PACKAGE_VERSION`) and `MODULE_VERSION`
-   in `hid-lg4ff.c`/`hid-lg.c` (wherever it is defined); add a section to
-   `CHANGELOG.md`.
+5. Bump the version in `hid-lg.h:5` (`#define VERSION`, used by
+   `MODULE_VERSION`), `dkms.conf` (`PACKAGE_VERSION`), `debian/changelog`,
+   `packaging/arch/PKGBUILD` (`pkgver`) and `packaging/rpm/new-lg4ff.spec`
+   (`Version` + `%changelog`); add a section to `CHANGELOG.md`.
 6. Commit, tag `vX.Y.Z` (annotated), push `master` and the tag.
 7. `gh release create vX.Y.Z --notes-file <notes>`; the notes are the
    changelog section plus the sysfs attributes added/changed and the udev

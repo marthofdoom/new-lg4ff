@@ -18,6 +18,8 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #include <linux/version.h>
+#include <linux/slab.h>
+#include <linux/string.h>
 
 #include "usbhid/usbhid.h"
 #include "hid-lg.h"
@@ -40,6 +42,16 @@
 #define LG4FF_INVERT_ABS_Z BIT(1)
 #define LG4FF_INVERT_ABS_RZ BIT(2)
 #define LG4FF_INVERT_ALL (LG4FF_INVERT_ABS_Y | LG4FF_INVERT_ABS_Z | LG4FF_INVERT_ABS_RZ)
+
+/* Pedal response, per pedal axis (ABS_Y, ABS_Z, ABS_RZ): the part of the
+ * travel used (start..end, in % of the axis as games see it, after
+ * inversion) and a sensitivity curve with the steering's convention. */
+#define LG4FF_PEDAL_AXES 3
+#define LG4FF_PEDAL_START_DEFAULT 0
+#define LG4FF_PEDAL_END_DEFAULT 100
+#define LG4FF_PEDAL_RESPONSE(start, end, sens) ((u32)(start) | (u32)(end) << 8 | (u32)(sens) << 16)
+#define LG4FF_PEDAL_RESPONSE_DEFAULT \
+	LG4FF_PEDAL_RESPONSE(LG4FF_PEDAL_START_DEFAULT, LG4FF_PEDAL_END_DEFAULT, LG4FF_SENSITIVITY_LINEAR)
 
 #define LG4FF_MODE_NATIVE_IDX 0
 #define LG4FF_MODE_DFEX_IDX 1
@@ -181,6 +193,9 @@ struct lg4ff_wheel_data {
 	u16 user_autocenter;
 	u16 app_gain;
 	u16 invert_pedals;
+	/* start | end << 8 | sensitivity << 16, one word per pedal so the
+	 * input path never sees half of an update */
+	u32 pedal_response[LG4FF_PEDAL_AXES];
 	u16 inertia_mode;	/* 0: as damper (Windows), 1: rendered in software */
 	const u16 min_range;
 	const u16 max_range;
@@ -1436,11 +1451,73 @@ static s32 lg4ff_apply_sensitivity(s32 value, s32 min, s32 max, u16 sensitivity)
 	return min_t(s32, max, centre + (s32)out);
 }
 
-/* Apply the user settings (sensitivity curve, pedal inversion) to a raw
- * axis value. `value` for ABS_X is after the DFP range correction. */
+/* Pedal response on an axis whose minimum is the released end: below
+ * `start` % of the travel the pedal reads released, from `end` % fully
+ * pressed, scaled in between, then curved like the steering (50 linear,
+ * lower softer near the start, higher sharper).
+ * Integer only: with a 16-bit axis every product fits in 32 bits. */
+static s32 lg4ff_apply_pedal_response(s32 value, s32 min, s32 max, u8 start, u8 end, u8 sensitivity)
+{
+	u32 span, u, lo, hi, curved, mix;
+
+	if ((start == LG4FF_PEDAL_START_DEFAULT && end == LG4FF_PEDAL_END_DEFAULT &&
+	     sensitivity == LG4FF_SENSITIVITY_LINEAR) || max <= min || end <= start)
+		return value;
+
+	span = (u32)(max - min);
+	if (span > 65535)
+		return value;		/* wider than any supported pedal: leave it */
+	if (value <= min)
+		u = 0;
+	else if (value >= max)
+		u = 65535;
+	else
+		u = (u32)(value - min) * 65535 / span;
+
+	lo = (u32)start * 65535 / 100;
+	hi = (u32)end * 65535 / 100;
+	if (u <= lo)
+		u = 0;
+	else if (u >= hi)
+		u = 65535;
+	else
+		u = (u - lo) * 65535 / (hi - lo);
+
+	if (sensitivity < LG4FF_SENSITIVITY_LINEAR) {
+		mix = (LG4FF_SENSITIVITY_LINEAR - sensitivity) * 2;
+		curved = u * u / 65535;
+		u = (u * (100 - mix) + curved * mix) / 100;
+	} else if (sensitivity > LG4FF_SENSITIVITY_LINEAR) {
+		mix = (sensitivity - LG4FF_SENSITIVITY_LINEAR) * 2;
+		curved = int_sqrt(u * 65535);
+		u = (u * (100 - mix) + curved * mix) / 100;
+	}
+
+	return min + (s32)(u * span / 65535);
+}
+
+static int lg4ff_pedal_index(unsigned int code)
+{
+	switch (code) {
+	case ABS_Y:
+		return 0;
+	case ABS_Z:
+		return 1;
+	case ABS_RZ:
+		return 2;
+	default:
+		return -1;
+	}
+}
+
+/* Apply the user settings (sensitivity curve, pedal inversion and
+ * response) to a raw axis value. `value` for ABS_X is after the DFP range
+ * correction. */
 static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code, s32 value)
 {
-	u16 bit;
+	u16 bit, inverted;
+	u32 response;
+	int i;
 
 	switch (code) {
 	case ABS_X:
@@ -1458,8 +1535,27 @@ static s32 lg4ff_adjust_axis(struct lg4ff_device_entry *entry, unsigned int code
 	default:
 		return value;
 	}
-	if (entry->wdata.invert_pedals & bit)
-		return entry->axis_max[code] + entry->axis_min[code] - value;
+	inverted = entry->wdata.invert_pedals & bit;
+	if (inverted)
+		value = entry->axis_max[code] + entry->axis_min[code] - value;
+	/* Combined pedals: one axis centred on a mix, the other parked; a
+	 * response curve would move the centre */
+	if (entry->wdata.combine)
+		return value;
+	i = lg4ff_pedal_index(code);
+	response = READ_ONCE(entry->wdata.pedal_response[i]);
+	if (response == LG4FF_PEDAL_RESPONSE_DEFAULT)
+		return value;
+	/* The response is in pedal travel: Logitech pedals rest at the
+	 * axis maximum unless inverted, so shape the mirrored value and
+	 * mirror it back, and the same setting means the same curve either
+	 * way round */
+	if (!inverted)
+		value = entry->axis_max[code] + entry->axis_min[code] - value;
+	value = lg4ff_apply_pedal_response(value, entry->axis_min[code], entry->axis_max[code],
+					   response & 0xff, (response >> 8) & 0xff, (response >> 16) & 0xff);
+	if (!inverted)
+		value = entry->axis_max[code] + entry->axis_min[code] - value;
 	return value;
 }
 
@@ -1608,6 +1704,8 @@ static void lg4ff_init_wheel_data(struct lg4ff_wheel_data * const wdata, const s
 						     .autocenter_persistent = 0,
 						     .app_gain = 1,
 						     .invert_pedals = 0,
+						     .pedal_response = { LG4FF_PEDAL_RESPONSE_DEFAULT, LG4FF_PEDAL_RESPONSE_DEFAULT,
+									 LG4FF_PEDAL_RESPONSE_DEFAULT },
 						     .inertia_mode = 0,
 						     .min_range = wheel->min_range,
 						     .max_range = wheel->max_range,
@@ -2103,6 +2201,11 @@ static ssize_t lg4ff_combine_store(struct device *dev, struct device_attribute *
 		combine = 2;
 
 	entry->wdata.combine = combine;
+	/* Pedal response is off while combined: show pedals at rest the
+	 * new way at once rather than at their next move */
+	lg4ff_reemit_axis(entry, ABS_Y);
+	lg4ff_reemit_axis(entry, ABS_Z);
+	lg4ff_reemit_axis(entry, ABS_RZ);
 	return count;
 }
 static DEVICE_ATTR(combine_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_combine_show, lg4ff_combine_store);
@@ -2146,6 +2249,85 @@ static ssize_t lg4ff_invert_pedals_store(struct device *dev, struct device_attri
 	return count;
 }
 static DEVICE_ATTR(invert_pedals, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH, lg4ff_invert_pedals_show, lg4ff_invert_pedals_store);
+
+/* Pedal response per axis: "start end sensitivity", start and end the %
+ * of the pedal's travel (from released, whichever way invert_pedals has
+ * it) where it begins and reaches full, sensitivity 0..100 with 50 linear.
+ * "0 100 50" leaves the pedal as it is; ignored while pedals are combined. */
+static ssize_t lg4ff_pedal_response_show(struct device *dev, char *buf, unsigned int code)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	int i = lg4ff_pedal_index(code);
+	u32 response;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL || i < 0)
+		return -EINVAL;
+
+	response = READ_ONCE(entry->wdata.pedal_response[i]);
+	return scnprintf(buf, PAGE_SIZE, "%u %u %u\n", response & 0xff, (response >> 8) & 0xff,
+			 (response >> 16) & 0xff);
+}
+
+static ssize_t lg4ff_pedal_response_store(struct device *dev, const char *buf, size_t count,
+					  unsigned int code)
+{
+	struct hid_device *hid = to_hid_device(dev);
+	struct lg4ff_device_entry *entry;
+	unsigned int values[3];
+	char *copy, *cursor, *field;
+	int i = lg4ff_pedal_index(code), n = 0, error = 0;
+
+	entry = lg4ff_get_device_entry(hid);
+	if (entry == NULL || i < 0)
+		return -EINVAL;
+
+	/* Exactly three numbers: kstrtouint refuses garbage and overflow,
+	 * which sscanf would let through */
+	copy = kstrndup(buf, count, GFP_KERNEL);
+	if (!copy)
+		return -ENOMEM;
+	cursor = strim(copy);
+	while ((field = strsep(&cursor, " \t")) != NULL) {
+		if (!*field)
+			continue;
+		if (n == 3 || kstrtouint(field, 10, &values[n])) {
+			error = -EINVAL;
+			break;
+		}
+		n++;
+	}
+	kfree(copy);
+	if (error || n != 3)
+		return -EINVAL;
+	if (values[1] > 100 || values[0] >= values[1] || values[2] > LG4FF_SENSITIVITY_MAX)
+		return -EINVAL;
+
+	WRITE_ONCE(entry->wdata.pedal_response[i], LG4FF_PEDAL_RESPONSE(values[0], values[1], values[2]));
+	lg4ff_reemit_axis(entry, code);
+
+	return count;
+}
+
+#define LG4FF_PEDAL_RESPONSE_ATTR(suffix, code)							\
+static ssize_t lg4ff_pedal_response_##suffix##_show(struct device *dev,			\
+						    struct device_attribute *attr, char *buf)	\
+{												\
+	return lg4ff_pedal_response_show(dev, buf, code);					\
+}												\
+static ssize_t lg4ff_pedal_response_##suffix##_store(struct device *dev,			\
+						     struct device_attribute *attr,		\
+						     const char *buf, size_t count)		\
+{												\
+	return lg4ff_pedal_response_store(dev, buf, count, code);				\
+}												\
+static DEVICE_ATTR(pedal_response_##suffix, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH,	\
+		   lg4ff_pedal_response_##suffix##_show, lg4ff_pedal_response_##suffix##_store)
+
+LG4FF_PEDAL_RESPONSE_ATTR(y, ABS_Y);
+LG4FF_PEDAL_RESPONSE_ATTR(z, ABS_Z);
+LG4FF_PEDAL_RESPONSE_ATTR(rz, ABS_RZ);
 
 /* Export the currently set range of the wheel */
 static ssize_t lg4ff_range_show(struct device *dev, struct device_attribute *attr,
@@ -3015,6 +3197,15 @@ int lg4ff_init(struct hid_device *hid)
 	error = device_create_file(&hid->dev, &dev_attr_invert_pedals);
 	if (error)
 		hid_warn(hid, "Unable to create sysfs interface for \"invert_pedals\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_pedal_response_y);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"pedal_response_y\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_pedal_response_z);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"pedal_response_z\", errno %d\n", error);
+	error = device_create_file(&hid->dev, &dev_attr_pedal_response_rz);
+	if (error)
+		hid_warn(hid, "Unable to create sysfs interface for \"pedal_response_rz\", errno %d\n", error);
 	if (mmode_ret == LG4FF_MMODE_IS_MULTIMODE) {
 		error = device_create_file(&hid->dev, &dev_attr_real_id);
 		if (error)
@@ -3145,6 +3336,9 @@ int lg4ff_deinit(struct hid_device *hid)
 	device_remove_file(&hid->dev, &dev_attr_range);
 	device_remove_file(&hid->dev, &dev_attr_sensitivity);
 	device_remove_file(&hid->dev, &dev_attr_invert_pedals);
+	device_remove_file(&hid->dev, &dev_attr_pedal_response_y);
+	device_remove_file(&hid->dev, &dev_attr_pedal_response_z);
+	device_remove_file(&hid->dev, &dev_attr_pedal_response_rz);
 
 	if (test_bit(FF_CONSTANT, dev->ffbit)) {
 		device_remove_file(&hid->dev, &dev_attr_gain);

@@ -17,6 +17,7 @@ override_dh_auto_clean:
 override_dh_auto_install:
 	install -d $(SRC)
 	install -m 644 Makefile Kbuild dkms.conf *.c *.h $(SRC)/
+	install -Dm644 usbhid/usbhid.h $(SRC)/usbhid/usbhid.h
 	sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="$(VERSION)"/' $(SRC)/dkms.conf
 
 override_dh_installdeb:
