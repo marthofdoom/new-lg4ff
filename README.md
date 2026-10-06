@@ -65,6 +65,8 @@ following ones:
   released, from end fully pressed, sensitivity 0-100 with 50 linear
   (lower is softer at the start of travel, higher sharper). "0 100 50"
   (default) leaves the pedal as it is. Ignored while pedals are combined.
+  A curve on a Y axis the hardware combines itself (compat modes, MOMO,
+  WingMan) bends the combined axis.
 
 ## Install from a package
 

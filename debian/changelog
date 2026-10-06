@@ -1,3 +1,10 @@
+new-lg4ff (0.8.0) unstable; urgency=medium
+
+  * Per-pedal response curves (pedal_response_y/z/rz); the DKMS package now
+    ships usbhid/usbhid.h so it builds (see CHANGELOG.md).
+
+ -- marth <marthofdoom@gmail.com>  Tue, 06 Oct 2026 00:30:00 +0000
+
 new-lg4ff (0.7.0) unstable; urgency=medium
 
   * Rumble emulation, ktime effect clock, review fixes (see CHANGELOG.md).

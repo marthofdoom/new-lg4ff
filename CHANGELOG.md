@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 — 2026-10-06
 
 ### Added
 - Pedal response per pedal: `pedal_response_y`, `pedal_response_z` and
@@ -8,7 +8,14 @@
   released end, full before the pedal bottoms out) and a sensitivity curve,
   in pedal-travel terms whichever way the pedal is inverted. Like G HUB's
   per-pedal sensitivity; asked for upstream as range of motion
-  (oversteer#273).
+  (oversteer#273). Each takes "start end sensitivity" (0-100 each, default
+  "0 100 50"), is mirrored under `invert_pedals`, and is ignored while
+  `combine_pedals` is on; turning combine on or off re-emits the pedal axes.
+
+### Fixed
+- Debian, Arch and RPM DKMS packages did not install `usbhid/usbhid.h`,
+  which `hid-lg.c` and `hid-lg4ff.c` include, so the module failed to build
+  from them.
 
 ## 0.7.0 — 2026-09-20
 

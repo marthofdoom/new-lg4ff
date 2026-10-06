@@ -1,6 +1,6 @@
 # Maintainer: marth <marthofdoom@gmail.com>
 pkgname=new-lg4ff-dkms
-pkgver=0.7.0
+pkgver=0.8.0
 pkgrel=1
 pkgdesc="Improved Logitech steering wheel force feedback driver (marthofdoom fork, DKMS)"
 arch=('any')
@@ -15,5 +15,6 @@ package() {
     cd "new-lg4ff-$pkgver"
     install -dm755 "$pkgdir/usr/src/new-lg4ff-$pkgver"
     install -m644 Makefile Kbuild dkms.conf *.c *.h "$pkgdir/usr/src/new-lg4ff-$pkgver/"
+    install -Dm644 usbhid/usbhid.h "$pkgdir/usr/src/new-lg4ff-$pkgver/usbhid/usbhid.h"
     sed -i "s/^PACKAGE_VERSION=.*/PACKAGE_VERSION=\"$pkgver\"/" "$pkgdir/usr/src/new-lg4ff-$pkgver/dkms.conf"
 }
